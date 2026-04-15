@@ -29,7 +29,7 @@ include_directories(
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
-add_executable(multi_mid360_calibrator src/multi_mid360_calibrator.cpp)
+add_executable(multi_mid360_calibrator src/multi_mid360_calibrator_with_cloud_export.cpp)
 ament_target_dependencies(multi_mid360_calibrator
   rclcpp sensor_msgs geometry_msgs visualization_msgs
   tf2 tf2_ros pcl_conversions

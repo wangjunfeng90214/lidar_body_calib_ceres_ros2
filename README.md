@@ -47,7 +47,7 @@ ros2 launch lidar_body_calib_ceres_ros2 calibrate.launch.py
 ```
 
 或直接运行：
-
+无点云文件保存
 ```bash
 ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
   -p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
@@ -58,9 +58,18 @@ ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
   -p min_plane_points:=300 \
   -p voxel_leaf_size:=0.01 \
   -p publish_tf:=true \
-  -p output_result_path:=/home/wangjunfeng/ros2_ws/log/lidar_body_calib_result.yaml
+  -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml
 ```
 
+保存点云文件
+```bash
+ros2 run multi_mid360_calibrator multi_mid360_calibrator_node \
+  --ros-args \
+  -p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
+  -p target_lidar_ip:=192.168.1.135 \
+  -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml \
+  -p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
+```
 ## 配置文件说明
 
 配置中 `planes` 是**车体系**下的理想平面，采用标准式：

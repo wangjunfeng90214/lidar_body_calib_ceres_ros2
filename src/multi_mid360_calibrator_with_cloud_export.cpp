@@ -1,3 +1,4 @@
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -7,25 +8,31 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/point_types_conversion.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/common/point_tests.h>
+#include <pcl/common/transforms.h>
+#include <pcl/io/pcd_io.h>
 
 #include <yaml-cpp/yaml.h>
 #include <ceres/ceres.h>
 #include <Eigen/Dense>
 
+#include <array>
+#include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
-#include <type_traits>
 
 using Eigen::Matrix3d;
 using Eigen::Vector3d;
@@ -45,16 +52,6 @@ Matrix3d skew(const Vector3d & v) {
        v.z(), 0.0, -v.x(),
       -v.y(), v.x(), 0.0;
   return m;
-}
-
-Matrix3d rodrigues(const Vector3d & w) {
-  const double theta = w.norm();
-  if (theta < 1e-12) {
-    return Matrix3d::Identity();
-  }
-  const Vector3d k = w / theta;
-  const Matrix3d K = skew(k);
-  return Matrix3d::Identity() + std::sin(theta) * K + (1.0 - std::cos(theta)) * K * K;
 }
 
 template<typename T>
@@ -130,27 +127,8 @@ Vector3d alignNormal(const Vector3d & n_meas, const Vector3d & n_prior) {
   return (n_meas.dot(n_prior) < 0.0) ? -n_meas : n_meas;
 }
 
-pair<Vector3d, double> orientPlaneTowardLidar(
-  const Vector3d & n_body_in, double d_body_in,
-  const Vector3d & lidar_pos_body)
-{
-  Vector3d n = normalizeVec(n_body_in);
-  double d = d_body_in;
-
-  const double side = n.dot(lidar_pos_body) + d;
-  if (side < 0.0) {
-    n = -n;
-    d = -d;
-  }
-  return {n, d};
-}
-
 double rad2deg(double r) {
   return r * 180.0 / M_PI;
-}
-
-double deg2rad(double d) {
-  return d * M_PI / 180.0;
 }
 
 string sanitizeIpToFrame(const string & ip) {
@@ -159,6 +137,24 @@ string sanitizeIpToFrame(const string & ip) {
     out.push_back(c == '.' ? '_' : c);
   }
   return out;
+}
+
+template<typename PointT>
+void finalizeCloud(typename pcl::PointCloud<PointT>::Ptr cloud) {
+  cloud->width = static_cast<uint32_t>(cloud->points.size());
+  cloud->height = 1;
+  cloud->is_dense = false;
+}
+
+pcl::PointXYZRGB makePointRGB(double x, double y, double z, uint8_t r, uint8_t g, uint8_t b) {
+  pcl::PointXYZRGB p;
+  p.x = static_cast<float>(x);
+  p.y = static_cast<float>(y);
+  p.z = static_cast<float>(z);
+  p.r = r;
+  p.g = g;
+  p.b = b;
+  return p;
 }
 
 struct PlaneMeasurement {
@@ -198,7 +194,6 @@ struct PlaneResidual {
     const T dL = T(dL_);
     const T D0 = T(D0_);
 
-    // Small rotation on body prior plane normal.
     const Eigen::Matrix<T, 3, 3> R_delta = rodriguesTemplate<T>(dtheta_v);
     Eigen::Matrix<T, 3, 1> Ni = R_delta * N0;
     const T Ni_norm = ceres::sqrt(Ni.squaredNorm() + T(1e-12));
@@ -252,9 +247,9 @@ struct LidarConfig {
   double x{0.0};
   double y{0.0};
   double z{0.0};
-  double roll_deg{0.0};
-  double pitch_deg{0.0};
-  double yaw_deg{0.0};
+  double roll{0.0};
+  double pitch{0.0};
+  double yaw{0.0};
   vector<Vector4d> planes;  // Ax+By+Cz+D=0 in body frame.
 };
 
@@ -285,6 +280,15 @@ public:
     declare_parameter<bool>("publish_tf", true);
     declare_parameter<string>("output_result_path", "/tmp/lidar_body_calib_result.yaml");
 
+    declare_parameter<bool>("save_raw_cloud", true);
+    declare_parameter<bool>("save_body_cloud", true);
+    declare_parameter<bool>("save_visualization_cloud", true);
+    declare_parameter<string>("output_cloud_dir", "/tmp/mid360_calib_outputs");
+    declare_parameter<double>("plane_vis_size", 0.8);
+    declare_parameter<double>("plane_vis_resolution", 0.05);
+    declare_parameter<double>("axis_vis_length", 0.4);
+    declare_parameter<double>("axis_vis_step", 0.01);
+
     config_path_ = get_parameter("config_path").as_string();
     target_lidar_ip_ = get_parameter("target_lidar_ip").as_string();
     accumulation_time_sec_ = get_parameter("accumulation_time_sec").as_double();
@@ -299,9 +303,20 @@ public:
     publish_tf_ = get_parameter("publish_tf").as_bool();
     output_result_path_ = get_parameter("output_result_path").as_string();
 
+    save_raw_cloud_ = get_parameter("save_raw_cloud").as_bool();
+    save_body_cloud_ = get_parameter("save_body_cloud").as_bool();
+    save_visualization_cloud_ = get_parameter("save_visualization_cloud").as_bool();
+    output_cloud_dir_ = get_parameter("output_cloud_dir").as_string();
+    plane_vis_size_ = get_parameter("plane_vis_size").as_double();
+    plane_vis_resolution_ = get_parameter("plane_vis_resolution").as_double();
+    axis_vis_length_ = get_parameter("axis_vis_length").as_double();
+    axis_vis_step_ = get_parameter("axis_vis_step").as_double();
+
     if (!loadConfig(config_path_)) {
       throw std::runtime_error("Failed to load config: " + config_path_);
     }
+
+    std::filesystem::create_directories(output_cloud_dir_);
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("calib_plane_markers", 1);
@@ -312,6 +327,17 @@ public:
   }
 
 private:
+  struct CalibrationResult {
+    Vector3d rpy_opt;
+    Vector3d t_opt;
+    Matrix3d R_opt;
+    double initial_cost{0.0};
+    double final_cost{0.0};
+    bool success{false};
+    string summary;
+    vector<PlaneMeasurement> used_measurements;
+  };
+
   bool loadConfig(const string & path) {
     YAML::Node root = YAML::LoadFile(path);
     if (!root || root.IsNull()) {
@@ -334,9 +360,9 @@ private:
       cfg.x = node["x"].as<double>();
       cfg.y = node["y"].as<double>();
       cfg.z = node["z"].as<double>();
-      cfg.roll_deg = node["roll"].as<double>();
-      cfg.pitch_deg = node["pitch"].as<double>();
-      cfg.yaw_deg = node["yaw"].as<double>();
+      cfg.roll = node["roll"].as<double>();
+      cfg.pitch = node["pitch"].as<double>();
+      cfg.yaw = node["yaw"].as<double>();
 
       for (const auto & plane_node : node["planes"]) {
         auto coeff = plane_node.as<vector<double>>();
@@ -356,7 +382,7 @@ private:
 
       lidar_configs_[cfg.ip] = cfg;
       lidar_states_[cfg.ip] = LidarState{};
-      RCLCPP_INFO(get_logger(), "Loaded lidar %s from topic %s with %zu planes. Input RPY uses degrees.",
+      RCLCPP_INFO(get_logger(), "Loaded lidar %s from topic %s with %zu planes.",
         cfg.ip.c_str(), cfg.topic.c_str(), cfg.planes.size());
     }
 
@@ -417,18 +443,31 @@ private:
       return;
     }
 
+    pcl::PointCloud<pcl::PointXYZ>::Ptr raw_cloud(new pcl::PointCloud<pcl::PointXYZ>(*state.accumulated));
+    finalizeCloud<pcl::PointXYZ>(raw_cloud);
+
+    if (save_raw_cloud_) {
+      saveRawCloud(ip, raw_cloud);
+    }
+
     pcl::PointCloud<pcl::PointXYZ>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZ>());
-    voxelDownsample(state.accumulated, filtered, voxel_leaf_size_);
+    voxelDownsample(raw_cloud, filtered, voxel_leaf_size_);
     RCLCPP_INFO(get_logger(), "Lidar %s accumulated %.2fs, raw=%zu, voxel=%zu",
-      ip.c_str(), elapsed, state.accumulated->size(), filtered->size());
+      ip.c_str(), elapsed, raw_cloud->size(), filtered->size());
 
     const auto result = calibrateSingleLidar(lidar_configs_.at(ip), filtered, msg->header.frame_id);
     if (result.has_value()) {
       writeResultYaml(ip, *result);
+
       if (publish_tf_) {
         publishTransform(ip, *result, msg->header.frame_id);
       }
       publishMarkers(ip, *result, msg->header.frame_id);
+
+      if (save_body_cloud_ || save_visualization_cloud_) {
+        saveBodyAndVisualizationClouds(ip, *result, raw_cloud);
+      }
+
       state.calibrated = true;
       RCLCPP_INFO(get_logger(), "Calibration complete for %s", ip.c_str());
     } else {
@@ -437,17 +476,6 @@ private:
       state.accumulated->clear();
     }
   }
-
-  struct CalibrationResult {
-    Vector3d rpy_opt;
-    Vector3d t_opt;
-    Matrix3d R_opt;
-    double initial_cost{0.0};
-    double final_cost{0.0};
-    bool success{false};
-    string summary;
-    vector<PlaneMeasurement> used_measurements;
-  };
 
   std::optional<CalibrationResult> calibrateSingleLidar(
     const LidarConfig & cfg,
@@ -462,7 +490,7 @@ private:
       return std::nullopt;
     }
 
-    double rpy[3] = {deg2rad(cfg.roll_deg), deg2rad(cfg.pitch_deg), deg2rad(cfg.yaw_deg)};
+    double rpy[3] = {cfg.roll, cfg.pitch, cfg.yaw};
     double t[3] = {cfg.x, cfg.y, cfg.z};
     vector<std::array<double, 3>> dtheta_blocks(measurements.size(), {0.0, 0.0, 0.0});
     vector<double> dD_blocks(measurements.size(), 0.0);
@@ -518,7 +546,7 @@ private:
     const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud)
   {
     vector<PlaneMeasurement> out;
-    const Matrix3d R0 = rpyToR(Vector3d(deg2rad(cfg.roll_deg), deg2rad(cfg.pitch_deg), deg2rad(cfg.yaw_deg)));
+    const Matrix3d R0 = rpyToR(Vector3d(cfg.roll, cfg.pitch, cfg.yaw));
     const Vector3d t0(cfg.x, cfg.y, cfg.z);
 
     for (std::size_t i = 0; i < cfg.planes.size(); ++i) {
@@ -530,17 +558,12 @@ private:
         continue;
       }
       N0 /= norm;
-      double d_body_std = p[3] / norm;    // body standard form n^T p + d = 0
-
-      // 自动统一平面方向：令法向量指向雷达初始位置所在半空间，
-      // 从而降低 YAML 中平面写法（n,d）与（-n,-d）对优化符号的影响。
-      const auto oriented_plane = orientPlaneTowardLidar(N0, d_body_std, t0);
-      N0 = oriented_plane.first;
-      d_body_std = oriented_plane.second;
-      const double D0 = -d_body_std;            // convert to N^T p = D
+      const double d_body_std = p[3] / norm;
+      const double D0 = -d_body_std;
 
       const auto pred_lidar_plane = transformPlaneBodyToLidar(R0, t0, N0, d_body_std);
-      const auto roi_cloud = extractPlanePoints(cloud, pred_lidar_plane.first, pred_lidar_plane.second, roi_distance_threshold_);
+      const auto roi_cloud = extractPlanePoints(
+        cloud, pred_lidar_plane.first, pred_lidar_plane.second, roi_distance_threshold_);
       RCLCPP_INFO(get_logger(), "Plane %zu for %s ROI points=%zu", i, cfg.ip.c_str(), roi_cloud->size());
       if (static_cast<int>(roi_cloud->size()) < min_plane_points_) {
         RCLCPP_WARN(get_logger(), "Plane %zu ROI too small for %s: %zu < %d", i, cfg.ip.c_str(),
@@ -585,9 +608,7 @@ private:
         out->points.push_back(pt);
       }
     }
-    out->width = static_cast<uint32_t>(out->points.size());
-    out->height = 1;
-    out->is_dense = false;
+    finalizeCloud<pcl::PointXYZ>(out);
     return out;
   }
 
@@ -628,6 +649,174 @@ private:
     voxel.setInputCloud(in);
     voxel.setLeafSize(static_cast<float>(leaf), static_cast<float>(leaf), static_cast<float>(leaf));
     voxel.filter(*out);
+  }
+
+  string makeBaseOutputPrefix(const string & ip) const {
+    const std::filesystem::path dir(output_cloud_dir_);
+    std::filesystem::create_directories(dir);
+    return (dir / sanitizeIpToFrame(ip)).string();
+  }
+
+  void saveRawCloud(const string & ip, const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const {
+    const string path = makeBaseOutputPrefix(ip) + "_raw_lidar.pcd";
+    if (pcl::io::savePCDFileBinary(path, *raw_cloud) == 0) {
+      RCLCPP_INFO(get_logger(), "Saved raw lidar cloud: %s", path.c_str());
+    } else {
+      RCLCPP_ERROR(get_logger(), "Failed to save raw lidar cloud: %s", path.c_str());
+    }
+  }
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr transformCloudToBody(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud_lidar,
+    const CalibrationResult & result) const
+  {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>());
+    out->reserve(cloud_lidar->size());
+    for (const auto & pt : cloud_lidar->points) {
+      if (!pcl::isFinite(pt)) {
+        continue;
+      }
+      const Vector3d p_l(pt.x, pt.y, pt.z);
+      const Vector3d p_b = result.R_opt * p_l + result.t_opt;
+      pcl::PointXYZ q;
+      q.x = static_cast<float>(p_b.x());
+      q.y = static_cast<float>(p_b.y());
+      q.z = static_cast<float>(p_b.z());
+      out->points.push_back(q);
+    }
+    finalizeCloud<pcl::PointXYZ>(out);
+    return out;
+  }
+
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr colorizeCloud(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+    uint8_t r, uint8_t g, uint8_t b) const
+  {
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>());
+    out->reserve(cloud->size());
+    for (const auto & pt : cloud->points) {
+      if (!pcl::isFinite(pt)) {
+        continue;
+      }
+      out->points.push_back(makePointRGB(pt.x, pt.y, pt.z, r, g, b));
+    }
+    finalizeCloud<pcl::PointXYZRGB>(out);
+    return out;
+  }
+
+  void appendPlanePatch(
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
+    const Vector3d & n, double d,
+    double plane_size, double resolution,
+    uint8_t r, uint8_t g, uint8_t b) const
+  {
+    Vector3d normal = normalizeVec(n);
+    Vector3d center = -d * normal;
+
+    Vector3d ref = (std::abs(normal.z()) < 0.9) ? Vector3d::UnitZ() : Vector3d::UnitX();
+    Vector3d u = normalizeVec(normal.cross(ref));
+    Vector3d v = normalizeVec(normal.cross(u));
+
+    const int steps = std::max(1, static_cast<int>(std::ceil(plane_size / resolution)));
+    const double half = plane_size * 0.5;
+    for (int i = -steps; i <= steps; ++i) {
+      for (int j = -steps; j <= steps; ++j) {
+        const double du = static_cast<double>(i) * resolution;
+        const double dv = static_cast<double>(j) * resolution;
+        if (std::abs(du) > half || std::abs(dv) > half) {
+          continue;
+        }
+        const Vector3d p = center + du * u + dv * v;
+        cloud->points.push_back(makePointRGB(p.x(), p.y(), p.z(), r, g, b));
+      }
+    }
+  }
+
+  void appendAxisLine(
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
+    const Vector3d & origin,
+    const Vector3d & direction,
+    double length,
+    double step,
+    uint8_t r, uint8_t g, uint8_t b) const
+  {
+    const Vector3d dir = normalizeVec(direction);
+    const int n = std::max(2, static_cast<int>(std::ceil(length / step)));
+    for (int i = 0; i <= n; ++i) {
+      const double s = std::min(length, i * step);
+      const Vector3d p = origin + s * dir;
+      cloud->points.push_back(makePointRGB(p.x(), p.y(), p.z(), r, g, b));
+    }
+  }
+
+  void appendFrameAxes(
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
+    const Vector3d & origin,
+    const Matrix3d & R,
+    double length,
+    double step) const
+  {
+    appendAxisLine(cloud, origin, R.col(0), length, step, 255, 0, 0);
+    appendAxisLine(cloud, origin, R.col(1), length, step, 0, 255, 0);
+    appendAxisLine(cloud, origin, R.col(2), length, step, 0, 0, 255);
+  }
+
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildVisualizationCloud(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud_body,
+    const CalibrationResult & result) const
+  {
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr vis = colorizeCloud(cloud_body, 180, 180, 180);
+
+    const std::array<std::array<uint8_t, 3>, 6> colors = {{
+      {{255, 128, 0}},
+      {{255, 0, 255}},
+      {{0, 255, 255}},
+      {{255, 255, 0}},
+      {{0, 128, 255}},
+      {{128, 255, 0}}
+    }};
+
+    for (std::size_t i = 0; i < result.used_measurements.size(); ++i) {
+      const auto & m = result.used_measurements[i];
+      const auto plane_body = transformPlaneToBody(result.R_opt, result.t_opt, m.n_lidar, m.d_lidar);
+      const auto & c = colors[i % colors.size()];
+      appendPlanePatch(vis, plane_body.first, plane_body.second,
+        plane_vis_size_, plane_vis_resolution_, c[0], c[1], c[2]);
+    }
+
+    appendFrameAxes(vis, Vector3d::Zero(), Matrix3d::Identity(), axis_vis_length_, axis_vis_step_);
+    appendFrameAxes(vis, result.t_opt, result.R_opt, axis_vis_length_, axis_vis_step_);
+
+    finalizeCloud<pcl::PointXYZRGB>(vis);
+    return vis;
+  }
+
+  void saveBodyAndVisualizationClouds(
+    const string & ip,
+    const CalibrationResult & result,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const
+  {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr body_cloud = transformCloudToBody(raw_cloud, result);
+    const string base = makeBaseOutputPrefix(ip);
+
+    if (save_body_cloud_) {
+      const string body_path = base + "_raw_in_body.pcd";
+      if (pcl::io::savePCDFileBinary(body_path, *body_cloud) == 0) {
+        RCLCPP_INFO(get_logger(), "Saved body-frame raw cloud: %s", body_path.c_str());
+      } else {
+        RCLCPP_ERROR(get_logger(), "Failed to save body-frame raw cloud: %s", body_path.c_str());
+      }
+    }
+
+    if (save_visualization_cloud_) {
+      pcl::PointCloud<pcl::PointXYZRGB>::Ptr vis_cloud = buildVisualizationCloud(body_cloud, result);
+      const string vis_path = base + "_body_with_planes_axes.pcd";
+      if (pcl::io::savePCDFileBinary(vis_path, *vis_cloud) == 0) {
+        RCLCPP_INFO(get_logger(), "Saved visualization cloud: %s", vis_path.c_str());
+      } else {
+        RCLCPP_ERROR(get_logger(), "Failed to save visualization cloud: %s", vis_path.c_str());
+      }
+    }
   }
 
   void writeResultYaml(const string & ip, const CalibrationResult & result) const {
@@ -683,9 +872,31 @@ private:
       N0.push_back(m.N0_body.z());
       item["N0_body"] = N0;
       item["D0_body"] = m.D0_body;
+
+      const auto plane_body = transformPlaneToBody(result.R_opt, result.t_opt, m.n_lidar, m.d_lidar);
+      YAML::Node nB;
+      nB.push_back(plane_body.first.x());
+      nB.push_back(plane_body.first.y());
+      nB.push_back(plane_body.first.z());
+      item["n_body_est"] = nB;
+      item["d_body_est"] = plane_body.second;
+
       planes.push_back(item);
     }
     root["used_planes"] = planes;
+
+    YAML::Node outputs;
+    const string base = makeBaseOutputPrefix(ip);
+    if (save_raw_cloud_) {
+      outputs["raw_lidar_pcd"] = base + "_raw_lidar.pcd";
+    }
+    if (save_body_cloud_) {
+      outputs["raw_body_pcd"] = base + "_raw_in_body.pcd";
+    }
+    if (save_visualization_cloud_) {
+      outputs["visualization_body_pcd"] = base + "_body_with_planes_axes.pcd";
+    }
+    root["output_files"] = outputs;
 
     string path = output_result_path_;
     const auto pos = path.rfind(".yaml");
@@ -753,6 +964,7 @@ private:
   string config_path_;
   string target_lidar_ip_;
   string output_result_path_;
+  string output_cloud_dir_;
   double accumulation_time_sec_{2.0};
   double roi_distance_threshold_{0.08};
   double ransac_distance_threshold_{0.02};
@@ -762,7 +974,14 @@ private:
   double wd_{20.0};
   double wp_{2.0};
   double wD_{5.0};
+  double plane_vis_size_{0.8};
+  double plane_vis_resolution_{0.05};
+  double axis_vis_length_{0.4};
+  double axis_vis_step_{0.01};
   bool publish_tf_{true};
+  bool save_raw_cloud_{true};
+  bool save_body_cloud_{true};
+  bool save_visualization_cloud_{true};
 
   map<string, LidarConfig> lidar_configs_;
   map<string, LidarState> lidar_states_;
