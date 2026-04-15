@@ -131,6 +131,24 @@ double rad2deg(double r) {
   return r * 180.0 / M_PI;
 }
 
+double deg2rad(double d) {
+  return d * M_PI / 180.0;
+}
+
+pair<Vector3d, double> orientPlaneTowardLidar(
+  const Vector3d & n_body_in, double d_body_in,
+  const Vector3d & lidar_pos_body)
+{
+  Vector3d n = normalizeVec(n_body_in);
+  double d = d_body_in;
+  const double side = n.dot(lidar_pos_body) + d;
+  if (side < 0.0) {
+    n = -n;
+    d = -d;
+  }
+  return {n, d};
+}
+
 string sanitizeIpToFrame(const string & ip) {
   string out = "lidar_";
   for (char c : ip) {
@@ -360,9 +378,9 @@ private:
       cfg.x = node["x"].as<double>();
       cfg.y = node["y"].as<double>();
       cfg.z = node["z"].as<double>();
-      cfg.roll = node["roll"].as<double>();
-      cfg.pitch = node["pitch"].as<double>();
-      cfg.yaw = node["yaw"].as<double>();
+      cfg.roll = deg2rad(node["roll"].as<double>());
+      cfg.pitch = deg2rad(node["pitch"].as<double>());
+      cfg.yaw = deg2rad(node["yaw"].as<double>());
 
       for (const auto & plane_node : node["planes"]) {
         auto coeff = plane_node.as<vector<double>>();
@@ -382,8 +400,9 @@ private:
 
       lidar_configs_[cfg.ip] = cfg;
       lidar_states_[cfg.ip] = LidarState{};
-      RCLCPP_INFO(get_logger(), "Loaded lidar %s from topic %s with %zu planes.",
-        cfg.ip.c_str(), cfg.topic.c_str(), cfg.planes.size());
+      RCLCPP_INFO(get_logger(), "Loaded lidar %s from topic %s with %zu planes. init_rpy_deg=[%.3f, %.3f, %.3f]",
+        cfg.ip.c_str(), cfg.topic.c_str(), cfg.planes.size(),
+        rad2deg(cfg.roll), rad2deg(cfg.pitch), rad2deg(cfg.yaw));
     }
 
     if (!target_lidar_ip_.empty() && lidar_configs_.find(target_lidar_ip_) == lidar_configs_.end()) {
@@ -558,7 +577,11 @@ private:
         continue;
       }
       N0 /= norm;
-      const double d_body_std = p[3] / norm;
+      double d_body_std = p[3] / norm;
+
+      const auto oriented_prior = orientPlaneTowardLidar(N0, d_body_std, t0);
+      N0 = oriented_prior.first;
+      d_body_std = oriented_prior.second;
       const double D0 = -d_body_std;
 
       const auto pred_lidar_plane = transformPlaneBodyToLidar(R0, t0, N0, d_body_std);
