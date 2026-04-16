@@ -62,6 +62,12 @@ ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
 ```
 
 保存点云文件
+
+```bash
+rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
+colcon build --packages-select multi_mid360_calibrator
+```
+
 ```bash
 ros2 run multi_mid360_calibrator multi_mid360_calibrator_node \
   --ros-args \
