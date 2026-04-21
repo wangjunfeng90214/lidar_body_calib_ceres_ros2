@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>lidar_body_calib_ceres_ros2</name>
+  <name>multi_mid360_calibrator</name>
   <version>0.1.0</version>
   <description>Mid-360 LiDAR to body extrinsic calibration with cloud export.</description>
   <maintainer email="user@example.com">OpenAI</maintainer>

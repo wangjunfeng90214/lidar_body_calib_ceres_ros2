@@ -62,11 +62,23 @@ ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
 ```
 
 保存点云文件
+
 ```bash
-ros2 run multi_mid360_calibrator multi_mid360_calibrator_node \
+conda deactivate
+rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
+colcon build --packages-select multi_mid360_calibrator
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
+source install/setup.bash 
+```
+
+```bash
+ros2 run multi_mid360_calibrator multi_mid360_calibrator \
   --ros-args \
   -p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
   -p target_lidar_ip:=192.168.1.135 \
+  -p accumulation_time_sec:=3.0 \
+  -p roi_distance_threshold:=0.02 \
+  -p ransac_distance_threshold:=0.01 \
   -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml \
   -p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
 ```
