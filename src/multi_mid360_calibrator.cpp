@@ -1081,7 +1081,7 @@ void printResult(const std::vector<PlaneMeasurement> & measurements, const Solve
   std::cout << "final_cost  : " << result.final_cost << "\n";
 
   std::cout << "\n------------------------------------------------------------------------\n";
-  std::cout << "optimized extrinsic: lidar -> body\n";
+  std::cout << "解算后的外参下，雷达在小车坐标系下的位置和姿态\n";
   std::cout << "------------------------------------------------------------------------\n";
   std::cout << std::setprecision(6);
   std::cout << "position in body (m): x=" << result.t_m.x()
