@@ -1476,7 +1476,7 @@ private:
       }
 
       YamlInput yin = loadYamlInput(cfg_.yaml_path, cfg_.lidar_ip, cfg_);
-      auto measurements = extractPlaneMeasurementsWithPadding(raw_accum_cloud_, yin, cfg_, roi_distance_threshold_);
+      auto measurements = extractPlaneMeasurements(raw_accum_cloud_, yin, cfg_);
       auto result = solveCeres(measurements, yin, cfg_);
       printResult(measurements, result, yin);
       saveSolverResultYaml(output_result_path_, target_lidar_ip_, result, yin, measurements);
