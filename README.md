@@ -148,4 +148,82 @@ ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 -p ransac_distance_threshold:=0.01 \
 -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml \
 -p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
+-p enable_figure8_verification=false
 ```
+
+
+# 平地 8 字轨迹动态法
+**这版主要增加了这些能力：**
+
+- 保留原来的静态三平面批量求解作为主标定。
+- 在 finalizeBatch() 后继续执行可选的 8 字轨迹动态验证。
+- 支持从 figure8_data_path 指向的目录读取：
+  - body_trajectory.csv
+  - lidar_trajectory.csv
+- 对两条轨迹做时间偏移扫描，自动找更优 time_offset_sec。
+- 基于相对运动构造 hand-eye 一致性约束，评估当前静态外参是否满足动态轨迹关系。
+- 可选做小范围微调，只允许很小的 rpy/t 修正，符合 PDF 里“动态复核/小幅微调”的定位。
+- 在输出 YAML 中增加更完整的 figure8_verification 结果，包括：
+  - matched_pose_pairs
+  - motion_pairs
+  - estimated_time_offset_sec
+  - rotation_consistency_deg
+  - translation_consistency_m
+  - refined_result
+
+**这版新增的 ROS2 参数包括：**
+
+- enable_figure8_verification
+- figure8_data_path
+- figure8_enable_micro_refine
+- figure8_replace_final_result_on_success
+- figure8_max_rotation_error_deg
+- figure8_max_translation_error_m
+- figure8_max_time_offset_sec
+- figure8_time_offset_step_sec
+- figure8_association_tolerance_sec
+- figure8_min_relative_translation_m
+- figure8_min_relative_rotation_deg
+- figure8_min_motion_pairs
+- figure8_max_num_iterations
+
+这版动态法的输入 CSV 约定为：
+
+```csv
+timestamp_sec,tx,ty,tz,qx,qy,qz,qw
+0.000, ...
+0.050, ...
+...
+```
+
+
+其中：
+
+- body_trajectory.csv 表示车体/底盘轨迹
+- lidar_trajectory.csv 表示雷达里程计或 LiDAR-IMU 轨迹
+
+我也说明一下当前边界：
+
+- 这版已经不是“占位接口”，而是可运行的离线动态复核后端。
+- 但它目前假设你已经有两条轨迹 CSV；还没有直接做 rosbag 回放解析。
+- 我没有在这里完成一次完整 ROS2 工程编译验证，所以不能声称已经在你本机环境 100% 编译通过；这一步还需要你在现有工作空间里实际编译确认。
+- 动态微调采用的是“小范围 hand-eye 一致性微调”，是工程上比较稳的第二阶段实现，和 PDF 的定位一致；它不是把静态法完全改写成一个大而全的联合优化器。
+
+建议你这样用：
+```bash
+ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+--ros-args \
+-p config_path:=/path/to/lidar_config.yaml \
+-p target_lidar_ip:=192.168.1.135 \
+-p input_topic:=/livox/lidar \
+-p accumulation_time_sec:=3.0 \
+-p output_result_path:=/path/to/result.yaml \
+-p output_cloud_dir:=/path/to/out_dir \
+-p enable_figure8_verification:=true \
+-p figure8_data_path:=/path/to/figure8_dataset \
+-p figure8_enable_micro_refine:=true
+```
+其中 /path/to/figure8_dataset 目录下放：
+
+- body_trajectory.csv
+- lidar_trajectory.csv

@@ -30,6 +30,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <optional>
+#include <map>
+#include <set>
+#include <numeric>
 
 using Eigen::Matrix3d;
 using Eigen::Vector3d;
@@ -203,16 +207,43 @@ struct BatchCalibrationSummary {
 struct Figure8VerificationConfig {
   bool enable{false};
   std::string data_path;
+
+  // 验收门限
   double max_rotation_error_deg{0.5};
   double max_translation_error_m{0.02};
+
+  // 时间对齐搜索
+  double max_time_offset_sec{0.08};
+  double time_offset_step_sec{0.01};
+  double association_tolerance_sec{0.02};
+
+  // 运动对筛选
+  double min_relative_translation_m{0.05};
+  double min_relative_rotation_deg{3.0};
+  int min_motion_pairs{15};
+
+  // 是否做小范围微调
+  bool enable_micro_refine{true};
+  bool replace_final_result_on_success{false};
+  int max_num_iterations{80};
 };
 
 struct Figure8VerificationResult {
   bool enabled{false};
   bool success{false};
   bool pass{false};
+
+  int matched_pose_pairs{0};
+  int motion_pairs{0};
+
+  double estimated_time_offset_sec{0.0};
   double rotation_consistency_deg{1e9};
   double translation_consistency_m{1e9};
+
+  bool refined_result_available{false};
+  Vector3d refined_rpy_rad{0.0, 0.0, 0.0};
+  Vector3d refined_t_m{0.0, 0.0, 0.0};
+
   std::string summary;
   std::string reject_reason;
 };
@@ -289,6 +320,32 @@ struct RansacFitResult {
 struct SeedOffset {
   Vector3d rpy_offset_rad{0.0, 0.0, 0.0};
   Vector3d t_offset_m{0.0, 0.0, 0.0};
+};
+
+struct TimedPose {
+  double t_sec{0.0};
+  Vector3d p{0.0, 0.0, 0.0};
+  Eigen::Quaterniond q{1.0, 0.0, 0.0, 0.0};
+};
+
+struct RelativeMotionPair {
+  int idx0{-1};
+  int idx1{-1};
+  Matrix3d R_a{Matrix3d::Identity()};
+  Vector3d t_a{0.0, 0.0, 0.0};
+  Matrix3d R_b{Matrix3d::Identity()};
+  Vector3d t_b{0.0, 0.0, 0.0};
+};
+
+struct InterpolatedPose {
+  bool ok{false};
+  Vector3d p{0.0, 0.0, 0.0};
+  Eigen::Quaterniond q{1.0, 0.0, 0.0, 0.0};
+};
+
+struct Figure8Dataset {
+  std::vector<TimedPose> body_traj;
+  std::vector<TimedPose> lidar_traj;
 };
 
 [[noreturn]] void fail(const std::string & msg) {
@@ -680,6 +737,371 @@ RoiBox parseRoiBox(const YAML::Node & node) {
   }
   return roi;
 }
+
+std::vector<std::string> splitCsvLine(const std::string & line) {
+  std::vector<std::string> out;
+  std::string cur;
+  std::stringstream ss(line);
+  while (std::getline(ss, cur, ',')) {
+    out.push_back(cur);
+  }
+  return out;
+}
+
+double parseDoubleStrict(const std::string & s, const std::string & field_name) {
+  try {
+    size_t pos = 0;
+    const double v = std::stod(s, &pos);
+    if (pos != s.size()) {
+      fail("invalid numeric field '" + field_name + "': " + s);
+    }
+    if (!std::isfinite(v)) {
+      fail("non-finite numeric field '" + field_name + "'");
+    }
+    return v;
+  } catch (const std::exception &) {
+    fail("failed to parse numeric field '" + field_name + "': " + s);
+  }
+}
+
+std::vector<TimedPose> loadTrajectoryCsv(const std::string & path) {
+  std::ifstream ifs(path);
+  if (!ifs) {
+    fail("failed to open trajectory csv: " + path);
+  }
+
+  std::vector<TimedPose> traj;
+  std::string line;
+  bool header_checked = false;
+
+  while (std::getline(ifs, line)) {
+    if (line.empty()) continue;
+    if (!header_checked) {
+      header_checked = true;
+      continue;
+    }
+
+    const auto cols = splitCsvLine(line);
+    if (cols.size() < 8) {
+      fail("trajectory csv requires 8 columns: timestamp_sec,tx,ty,tz,qx,qy,qz,qw");
+    }
+
+    TimedPose s;
+    s.t_sec = parseDoubleStrict(cols[0], "timestamp_sec");
+    s.p = Vector3d(
+      parseDoubleStrict(cols[1], "tx"),
+      parseDoubleStrict(cols[2], "ty"),
+      parseDoubleStrict(cols[3], "tz"));
+
+    const double qx = parseDoubleStrict(cols[4], "qx");
+    const double qy = parseDoubleStrict(cols[5], "qy");
+    const double qz = parseDoubleStrict(cols[6], "qz");
+    const double qw = parseDoubleStrict(cols[7], "qw");
+    Eigen::Quaterniond q(qw, qx, qy, qz);
+    if (q.norm() < kEps) {
+      fail("invalid quaternion norm in: " + path);
+    }
+    s.q = q.normalized();
+    if (s.q.w() < 0.0) s.q.coeffs() *= -1.0;
+
+    traj.push_back(s);
+  }
+
+  if (traj.size() < 2) {
+    fail("trajectory csv has too few samples: " + path);
+  }
+
+  std::sort(traj.begin(), traj.end(), [](const TimedPose & a, const TimedPose & b) {
+    return a.t_sec < b.t_sec;
+  });
+
+  return traj;
+}
+
+InterpolatedPose interpolatePose(const std::vector<TimedPose> & traj, double t_sec) {
+  InterpolatedPose out;
+  if (traj.size() < 2) return out;
+  if (t_sec < traj.front().t_sec || t_sec > traj.back().t_sec) return out;
+
+  auto it = std::lower_bound(
+    traj.begin(), traj.end(), t_sec,
+    [](const TimedPose & a, double t) { return a.t_sec < t; });
+
+  if (it == traj.begin()) {
+    out.ok = true;
+    out.p = it->p;
+    out.q = it->q;
+    return out;
+  }
+  if (it == traj.end()) {
+    out.ok = true;
+    out.p = traj.back().p;
+    out.q = traj.back().q;
+    return out;
+  }
+
+  const auto & s1 = *it;
+  const auto & s0 = *(it - 1);
+  const double dt = s1.t_sec - s0.t_sec;
+  if (dt < 1e-9) return out;
+
+  const double alpha = (t_sec - s0.t_sec) / dt;
+  out.ok = true;
+  out.p = (1.0 - alpha) * s0.p + alpha * s1.p;
+  out.q = s0.q.slerp(alpha, s1.q).normalized();
+  if (out.q.w() < 0.0) out.q.coeffs() *= -1.0;
+  return out;
+}
+
+Figure8Dataset loadFigure8Dataset(const Figure8VerificationConfig & cfg) {
+  Figure8Dataset ds;
+  const std::filesystem::path root(cfg.data_path);
+  ds.body_traj = loadTrajectoryCsv((root / "body_trajectory.csv").string());
+  ds.lidar_traj = loadTrajectoryCsv((root / "lidar_trajectory.csv").string());
+  return ds;
+}
+
+Eigen::Isometry3d makePose(const Vector3d & p, const Eigen::Quaterniond & q) {
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  T.linear() = q.normalized().toRotationMatrix();
+  T.translation() = p;
+  return T;
+}
+
+double rotationAngleDeg(const Matrix3d & R) {
+  Eigen::AngleAxisd aa(R);
+  return rad2deg(std::abs(aa.angle()));
+}
+
+std::vector<RelativeMotionPair> buildRelativeMotionPairs(
+  const std::vector<TimedPose> & body_aligned,
+  const std::vector<TimedPose> & lidar_aligned,
+  const Figure8VerificationConfig & cfg)
+{
+  std::vector<RelativeMotionPair> pairs;
+  const int n = static_cast<int>(std::min(body_aligned.size(), lidar_aligned.size()));
+  if (n < 2) return pairs;
+
+  for (int i = 0; i < n - 1; ++i) {
+    const Eigen::Isometry3d A0 = makePose(body_aligned[i].p, body_aligned[i].q);
+    const Eigen::Isometry3d A1 = makePose(body_aligned[i + 1].p, body_aligned[i + 1].q);
+    const Eigen::Isometry3d B0 = makePose(lidar_aligned[i].p, lidar_aligned[i].q);
+    const Eigen::Isometry3d B1 = makePose(lidar_aligned[i + 1].p, lidar_aligned[i + 1].q);
+
+    const Eigen::Isometry3d dA = A0.inverse() * A1;
+    const Eigen::Isometry3d dB = B0.inverse() * B1;
+
+    const double trans_a = dA.translation().norm();
+    const double rot_a_deg = rotationAngleDeg(dA.linear());
+
+    if (trans_a < cfg.min_relative_translation_m &&
+        rot_a_deg < cfg.min_relative_rotation_deg) {
+      continue;
+        }
+
+    RelativeMotionPair mp;
+    mp.idx0 = i;
+    mp.idx1 = i + 1;
+    mp.R_a = dA.linear();
+    mp.t_a = dA.translation();
+    mp.R_b = dB.linear();
+    mp.t_b = dB.translation();
+    pairs.push_back(mp);
+  }
+  return pairs;
+}
+
+bool buildAlignedTrajectoryPairs(
+  const Figure8Dataset & ds,
+  double time_offset_sec,
+  double assoc_tol_sec,
+  std::vector<TimedPose> & body_aligned,
+  std::vector<TimedPose> & lidar_aligned)
+{
+  body_aligned.clear();
+  lidar_aligned.clear();
+
+  for (const auto & body_s : ds.body_traj) {
+    const double t_lidar = body_s.t_sec + time_offset_sec;
+    const auto interp = interpolatePose(ds.lidar_traj, t_lidar);
+    if (!interp.ok) continue;
+
+    auto it = std::lower_bound(
+      ds.lidar_traj.begin(), ds.lidar_traj.end(), t_lidar,
+      [](const TimedPose & a, double t) { return a.t_sec < t; });
+
+    double nearest_dt = 1e9;
+    if (it != ds.lidar_traj.end()) {
+      nearest_dt = std::min(nearest_dt, std::abs(it->t_sec - t_lidar));
+    }
+    if (it != ds.lidar_traj.begin()) {
+      nearest_dt = std::min(nearest_dt, std::abs((it - 1)->t_sec - t_lidar));
+    }
+    if (nearest_dt > assoc_tol_sec) continue;
+
+    body_aligned.push_back(body_s);
+    TimedPose ls;
+    ls.t_sec = t_lidar;
+    ls.p = interp.p;
+    ls.q = interp.q;
+    lidar_aligned.push_back(ls);
+  }
+
+  return body_aligned.size() >= 2 && lidar_aligned.size() == body_aligned.size();
+}
+
+void evaluateFigure8Consistency(
+  const std::vector<RelativeMotionPair> & pairs,
+  const Matrix3d & R_lidar_to_body,
+  const Vector3d & t_lidar_to_body,
+  double & rotation_consistency_deg,
+  double & translation_consistency_m)
+{
+  rotation_consistency_deg = 1e9;
+  translation_consistency_m = 1e9;
+  if (pairs.empty()) return;
+
+  std::vector<double> rot_errs_deg;
+  std::vector<double> trans_errs_m;
+  rot_errs_deg.reserve(pairs.size());
+  trans_errs_m.reserve(pairs.size());
+
+  const Matrix3d R = R_lidar_to_body;
+  const Vector3d t = t_lidar_to_body;
+
+  for (const auto & mp : pairs) {
+    const Matrix3d left_R = mp.R_a * R;
+    const Matrix3d right_R = R * mp.R_b;
+    const Matrix3d R_err = left_R.transpose() * right_R;
+    rot_errs_deg.push_back(rotationAngleDeg(R_err));
+
+    const Vector3d left_t = mp.R_a * t + mp.t_a;
+    const Vector3d right_t = R * mp.t_b + t;
+    trans_errs_m.push_back((left_t - right_t).norm());
+  }
+
+  auto mean_of = [](const std::vector<double> & v) {
+    return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
+  };
+
+  rotation_consistency_deg = mean_of(rot_errs_deg);
+  translation_consistency_m = mean_of(trans_errs_m);
+}
+
+struct Figure8MotionResidual {
+  struct PackedMotion {
+    Matrix3d R_a{Matrix3d::Identity()};
+    Vector3d t_a{0.0, 0.0, 0.0};
+    Matrix3d R_b{Matrix3d::Identity()};
+    Vector3d t_b{0.0, 0.0, 0.0};
+    Matrix3d R_x0{Matrix3d::Identity()};
+    Vector3d t_x0{0.0, 0.0, 0.0};
+  };
+
+  Figure8MotionResidual(const RelativeMotionPair & mp, double w_rot, double w_trans)
+  : w_rot_(w_rot), w_trans_(w_trans) {
+    mp_.R_a = mp.R_a;
+    mp_.t_a = mp.t_a;
+    mp_.R_b = mp.R_b;
+    mp_.t_b = mp.t_b;
+  }
+
+  template<typename T>
+  bool operator()(const T * const d_rpy, const T * const d_t, T * residuals) const {
+    const Eigen::Matrix<T, 3, 1> drpy(d_rpy[0], d_rpy[1], d_rpy[2]);
+    const Eigen::Matrix<T, 3, 1> dt(d_t[0], d_t[1], d_t[2]);
+    const Eigen::Matrix<T, 3, 3> dR = rpyToRTemplate<T>(drpy);
+
+    const Eigen::Matrix<T, 3, 3> R0 = mp_.R_x0.cast<T>();
+    const Eigen::Matrix<T, 3, 1> t0 = mp_.t_x0.cast<T>();
+
+    const Eigen::Matrix<T, 3, 3> R = dR * R0;
+    const Eigen::Matrix<T, 3, 1> t = t0 + dt;
+
+    const Eigen::Matrix<T, 3, 3> left_R  = mp_.R_a.cast<T>() * R;
+    const Eigen::Matrix<T, 3, 3> right_R = R * mp_.R_b.cast<T>();
+    const Eigen::Matrix<T, 3, 3> R_err = left_R.transpose() * right_R;
+
+    const Eigen::Matrix<T, 3, 1> rot_vec(
+      R_err(2,1) - R_err(1,2),
+      R_err(0,2) - R_err(2,0),
+      R_err(1,0) - R_err(0,1));
+
+    const Eigen::Matrix<T, 3, 1> left_t  = mp_.R_a.cast<T>() * t + mp_.t_a.cast<T>();
+    const Eigen::Matrix<T, 3, 1> right_t = R * mp_.t_b.cast<T>() + t;
+    const Eigen::Matrix<T, 3, 1> trans_err = left_t - right_t;
+
+    residuals[0] = T(w_rot_)   * rot_vec[0];
+    residuals[1] = T(w_rot_)   * rot_vec[1];
+    residuals[2] = T(w_rot_)   * rot_vec[2];
+    residuals[3] = T(w_trans_) * trans_err[0];
+    residuals[4] = T(w_trans_) * trans_err[1];
+    residuals[5] = T(w_trans_) * trans_err[2];
+    return true;
+  }
+
+  static ceres::CostFunction * Create(
+    const RelativeMotionPair & mp,
+    const Matrix3d & R_x0,
+    const Vector3d & t_x0,
+    double w_rot,
+    double w_trans)
+  {
+    auto * obj = new Figure8MotionResidual(mp, w_rot, w_trans);
+    obj->mp_.R_x0 = R_x0;
+    obj->mp_.t_x0 = t_x0;
+    return new ceres::AutoDiffCostFunction<Figure8MotionResidual, 6, 3, 3>(obj);
+  }
+
+  PackedMotion mp_;
+  double w_rot_{1.0};
+  double w_trans_{1.0};
+};
+
+bool refineExtrinsicByFigure8(
+  const std::vector<RelativeMotionPair> & pairs,
+  const Figure8VerificationConfig & cfg,
+  Vector3d & rpy_rad,
+  Vector3d & t_m)
+{
+  if (pairs.size() < static_cast<size_t>(cfg.min_motion_pairs)) return false;
+
+  double d_rpy[3] = {0.0, 0.0, 0.0};
+  double d_t[3] = {0.0, 0.0, 0.0};
+
+  ceres::Problem problem;
+  const Matrix3d R0 = rpyToR(rpy_rad);
+  for (const auto & mp : pairs) {
+    auto * cost = Figure8MotionResidual::Create(mp, R0, t_m, 1.0, 5.0);
+    problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), d_rpy, d_t);
+  }
+
+  const double max_rot = deg2rad(1.0);
+  const double max_trans = 0.02;
+  for (int i = 0; i < 3; ++i) {
+    problem.SetParameterLowerBound(d_rpy, i, -max_rot);
+    problem.SetParameterUpperBound(d_rpy, i,  max_rot);
+    problem.SetParameterLowerBound(d_t, i, -max_trans);
+    problem.SetParameterUpperBound(d_t, i,  max_trans);
+  }
+
+  ceres::Solver::Options options;
+  options.max_num_iterations = cfg.max_num_iterations;
+  options.linear_solver_type = ceres::DENSE_QR;
+  options.minimizer_progress_to_stdout = false;
+  options.function_tolerance = 1e-10;
+  options.gradient_tolerance = 1e-10;
+  options.parameter_tolerance = 1e-10;
+
+  ceres::Solver::Summary summary;
+  ceres::Solve(options, &problem, &summary);
+  if (!summary.IsSolutionUsable()) return false;
+
+  rpy_rad += Vector3d(d_rpy[0], d_rpy[1], d_rpy[2]);
+  t_m += Vector3d(d_t[0], d_t[1], d_t[2]);
+  return true;
+}
+
 
 double readAngleWithUnit(const YAML::Node & parent, const char * key, const std::string & angle_unit) {
   if (!parent[key]) fail(std::string("missing angle field: ") + key);
@@ -1635,22 +2057,135 @@ BatchCalibrationSummary aggregateBatchResults(const std::vector<CalibrationRunRe
 
 Figure8VerificationResult verifyFigure8(
   const Figure8VerificationConfig & cfg,
-  const BatchCalibrationSummary & summary)
+  const BatchCalibrationSummary & batch)
 {
   Figure8VerificationResult out;
   out.enabled = cfg.enable;
-  if (!cfg.enable) return out;
-  if (!summary.batch_stable) {
-    out.success = false;
-    out.pass = false;
-    out.reject_reason = "static batch not stable, skip figure8 verification";
+  if (!cfg.enable) {
+    out.success = true;
+    out.pass = true;
+    out.summary = "figure8 verification disabled";
     return out;
   }
-  out.success = false;
-  out.pass = false;
-  out.summary = "figure8 verification interface reserved; bag/trajectory backend not implemented in this file";
-  out.reject_reason = cfg.data_path.empty() ? "figure8_data_path is empty" : "figure8 backend pending";
-  return out;
+
+  if (cfg.data_path.empty()) {
+    out.success = false;
+    out.pass = false;
+    out.reject_reason = "figure8_data_path is empty";
+    out.summary = out.reject_reason;
+    return out;
+  }
+
+  if (batch.representative_run_index < 0 ||
+      batch.representative_run_index >= static_cast<int>(batch.all_runs.size())) {
+    out.success = false;
+    out.pass = false;
+    out.reject_reason = "batch has no representative run";
+    out.summary = out.reject_reason;
+    return out;
+  }
+
+  try {
+    const auto ds = loadFigure8Dataset(cfg);
+    const auto & rep = batch.all_runs[batch.representative_run_index];
+
+    double best_score = 1e18;
+    double best_time_offset = 0.0;
+    std::vector<TimedPose> best_body_aligned;
+    std::vector<TimedPose> best_lidar_aligned;
+    std::vector<RelativeMotionPair> best_pairs;
+    double best_rot_deg = 1e9;
+    double best_trans_m = 1e9;
+
+    for (double dt = -cfg.max_time_offset_sec;
+         dt <= cfg.max_time_offset_sec + 1e-12;
+         dt += cfg.time_offset_step_sec) {
+
+      std::vector<TimedPose> body_aligned;
+      std::vector<TimedPose> lidar_aligned;
+      if (!buildAlignedTrajectoryPairs(ds, dt, cfg.association_tolerance_sec,
+                                       body_aligned, lidar_aligned)) {
+        continue;
+      }
+
+      auto pairs = buildRelativeMotionPairs(body_aligned, lidar_aligned, cfg);
+      if (pairs.size() < static_cast<size_t>(cfg.min_motion_pairs)) {
+        continue;
+      }
+
+      double rot_deg = 1e9;
+      double trans_m = 1e9;
+      evaluateFigure8Consistency(pairs, rep.final_R, rep.final_t_m, rot_deg, trans_m);
+
+      const double score = rot_deg + 100.0 * trans_m;
+      if (score < best_score) {
+        best_score = score;
+        best_time_offset = dt;
+        best_body_aligned = body_aligned;
+        best_lidar_aligned = lidar_aligned;
+        best_pairs = pairs;
+        best_rot_deg = rot_deg;
+        best_trans_m = trans_m;
+      }
+    }
+
+    if (best_pairs.size() < static_cast<size_t>(cfg.min_motion_pairs)) {
+      out.success = false;
+      out.pass = false;
+      out.reject_reason = "not enough valid motion pairs for figure8 verification";
+      out.summary = out.reject_reason;
+      return out;
+    }
+
+    out.success = true;
+    out.matched_pose_pairs = static_cast<int>(best_body_aligned.size());
+    out.motion_pairs = static_cast<int>(best_pairs.size());
+    out.estimated_time_offset_sec = best_time_offset;
+    out.rotation_consistency_deg = best_rot_deg;
+    out.translation_consistency_m = best_trans_m;
+
+    Vector3d refined_rpy = rep.final_rpy_rad;
+    Vector3d refined_t = rep.final_t_m;
+    if (cfg.enable_micro_refine) {
+      if (refineExtrinsicByFigure8(best_pairs, cfg, refined_rpy, refined_t)) {
+        out.refined_result_available = true;
+        out.refined_rpy_rad = refined_rpy;
+        out.refined_t_m = refined_t;
+
+        double rot2 = 1e9;
+        double trans2 = 1e9;
+        evaluateFigure8Consistency(best_pairs, rpyToR(refined_rpy), refined_t, rot2, trans2);
+
+        out.rotation_consistency_deg = rot2;
+        out.translation_consistency_m = trans2;
+      }
+    }
+
+    out.pass =
+      out.rotation_consistency_deg <= cfg.max_rotation_error_deg &&
+      out.translation_consistency_m <= cfg.max_translation_error_m;
+
+    std::ostringstream oss;
+    oss << "figure8 verification "
+        << (out.pass ? "pass" : "fail")
+        << ", matched_pose_pairs=" << out.matched_pose_pairs
+        << ", motion_pairs=" << out.motion_pairs
+        << ", time_offset_sec=" << std::fixed << std::setprecision(4) << out.estimated_time_offset_sec
+        << ", rot_deg=" << out.rotation_consistency_deg
+        << ", trans_m=" << out.translation_consistency_m;
+    out.summary = oss.str();
+
+    if (!out.pass) {
+      out.reject_reason = out.summary;
+    }
+    return out;
+  } catch (const std::exception & e) {
+    out.success = false;
+    out.pass = false;
+    out.reject_reason = e.what();
+    out.summary = std::string("figure8 verification failed: ") + e.what();
+    return out;
+  }
 }
 
 void saveBatchCalibrationYaml(
@@ -1731,8 +2266,24 @@ void saveBatchCalibrationYaml(
   out << YAML::Key << "enabled" << YAML::Value << fig8.enabled;
   out << YAML::Key << "success" << YAML::Value << fig8.success;
   out << YAML::Key << "pass" << YAML::Value << fig8.pass;
+  out << YAML::Key << "matched_pose_pairs" << YAML::Value << fig8.matched_pose_pairs;
+  out << YAML::Key << "motion_pairs" << YAML::Value << fig8.motion_pairs;
+  out << YAML::Key << "estimated_time_offset_sec" << YAML::Value << fig8.estimated_time_offset_sec;
   out << YAML::Key << "rotation_consistency_deg" << YAML::Value << fig8.rotation_consistency_deg;
   out << YAML::Key << "translation_consistency_m" << YAML::Value << fig8.translation_consistency_m;
+  out << YAML::Key << "refined_result_available" << YAML::Value << fig8.refined_result_available;
+
+  if (fig8.refined_result_available) {
+    out << YAML::Key << "refined_result" << YAML::Value << YAML::BeginMap;
+    out << YAML::Key << "x" << YAML::Value << fig8.refined_t_m.x();
+    out << YAML::Key << "y" << YAML::Value << fig8.refined_t_m.y();
+    out << YAML::Key << "z" << YAML::Value << fig8.refined_t_m.z();
+    out << YAML::Key << "roll_rad" << YAML::Value << fig8.refined_rpy_rad.x();
+    out << YAML::Key << "pitch_rad" << YAML::Value << fig8.refined_rpy_rad.y();
+    out << YAML::Key << "yaw_rad" << YAML::Value << fig8.refined_rpy_rad.z();
+    out << YAML::EndMap;
+  }
+
   out << YAML::Key << "summary" << YAML::Value << fig8.summary;
   out << YAML::Key << "reject_reason" << YAML::Value << fig8.reject_reason;
   out << YAML::EndMap;
@@ -1843,6 +2394,17 @@ public:
     declare_parameter<double>("padding_roi_margin_m", 0.02);
     declare_parameter<bool>("enable_figure8_verification", false);
     declare_parameter<std::string>("figure8_data_path", "");
+    declare_parameter<bool>("figure8_enable_micro_refine", true);
+    declare_parameter<bool>("figure8_replace_final_result_on_success", false);
+    declare_parameter<double>("figure8_max_rotation_error_deg", 0.5);
+    declare_parameter<double>("figure8_max_translation_error_m", 0.02);
+    declare_parameter<double>("figure8_max_time_offset_sec", 0.08);
+    declare_parameter<double>("figure8_time_offset_step_sec", 0.01);
+    declare_parameter<double>("figure8_association_tolerance_sec", 0.02);
+    declare_parameter<double>("figure8_min_relative_translation_m", 0.05);
+    declare_parameter<double>("figure8_min_relative_rotation_deg", 3.0);
+    declare_parameter<int>("figure8_min_motion_pairs", 15);
+    declare_parameter<int>("figure8_max_num_iterations", 80);
 
     get_parameter("config_path", config_path_);
     get_parameter("target_lidar_ip", target_lidar_ip_);
@@ -1857,6 +2419,17 @@ public:
     get_parameter("padding_roi_margin_m", padding_roi_margin_);
     get_parameter("enable_figure8_verification", figure8_cfg_.enable);
     get_parameter("figure8_data_path", figure8_cfg_.data_path);
+    get_parameter("figure8_enable_micro_refine", figure8_cfg_.enable_micro_refine);
+    get_parameter("figure8_replace_final_result_on_success", figure8_cfg_.replace_final_result_on_success);
+    get_parameter("figure8_max_rotation_error_deg", figure8_cfg_.max_rotation_error_deg);
+    get_parameter("figure8_max_translation_error_m", figure8_cfg_.max_translation_error_m);
+    get_parameter("figure8_max_time_offset_sec", figure8_cfg_.max_time_offset_sec);
+    get_parameter("figure8_time_offset_step_sec", figure8_cfg_.time_offset_step_sec);
+    get_parameter("figure8_association_tolerance_sec", figure8_cfg_.association_tolerance_sec);
+    get_parameter("figure8_min_relative_translation_m", figure8_cfg_.min_relative_translation_m);
+    get_parameter("figure8_min_relative_rotation_deg", figure8_cfg_.min_relative_rotation_deg);
+    figure8_cfg_.min_motion_pairs = get_parameter("figure8_min_motion_pairs").as_int();
+    figure8_cfg_.max_num_iterations = get_parameter("figure8_max_num_iterations").as_int();
 
     cfg_.yaml_path = config_path_;
     cfg_.lidar_ip = target_lidar_ip_;
@@ -2004,6 +2577,23 @@ private:
     try {
       batch_summary_ = aggregateBatchResults(all_runs_);
       figure8_result_ = verifyFigure8(figure8_cfg_, batch_summary_);
+      if (figure8_result_.success &&
+        figure8_result_.pass &&
+        figure8_result_.refined_result_available &&
+        figure8_cfg_.replace_final_result_on_success &&
+        batch_summary_.representative_run_index >= 0 &&
+        batch_summary_.representative_run_index < static_cast<int>(batch_summary_.all_runs.size())) {
+
+          auto & rep = batch_summary_.all_runs[batch_summary_.representative_run_index];
+          rep.final_rpy_rad = figure8_result_.refined_rpy_rad;
+          rep.final_t_m = figure8_result_.refined_t_m;
+          rep.final_R = rpyToR(rep.final_rpy_rad);
+
+          batch_summary_.robust_rpy_rad = rep.final_rpy_rad;
+          batch_summary_.robust_t_m = rep.final_t_m;
+          batch_summary_.robust_q = rotationMatrixToQuaternion(rep.final_R);
+      }
+
       saveBatchCalibrationYaml(output_result_path_, target_lidar_ip_, batch_summary_, figure8_result_);
       if (!output_result_path_.empty()) {
         RCLCPP_INFO(get_logger(), "saved batch calibration yaml to: %s", output_result_path_.c_str());
