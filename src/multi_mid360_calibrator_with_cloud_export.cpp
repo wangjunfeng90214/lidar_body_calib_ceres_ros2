@@ -1,184 +1,58 @@
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2_ros/transform_broadcaster.h>
-
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+#include <Eigen/Dense>
+#include <pcl/common/point_tests.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/point_types_conversion.h>
-#include <pcl_conversions/pcl_conversions.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/extract_indices.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/common/point_tests.h>
-#include <pcl/common/transforms.h>
-#include <pcl/io/pcd_io.h>
-
 #include <yaml-cpp/yaml.h>
-#include <ceres/ceres.h>
-#include <Eigen/Dense>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <builtin_interfaces/msg/time.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <pcl_conversions/pcl_conversions.h>
 
-#include <array>
-#include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <limits>
-#include <map>
-#include <memory>
-#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 using Eigen::Matrix3d;
 using Eigen::Vector3d;
 using Eigen::Vector4d;
-using std::map;
-using std::pair;
-using std::string;
-using std::vector;
 
 namespace {
 
 constexpr double kEps = 1e-12;
+constexpr double kSmallAngleThreshold = 1e-10;
+constexpr double kMaxReasonablePointCoordAbs = 1e6;
 
-Matrix3d skew(const Vector3d & v) {
-  Matrix3d m;
-  m << 0.0, -v.z(), v.y(),
-       v.z(), 0.0, -v.x(),
-      -v.y(), v.x(), 0.0;
-  return m;
-}
+enum class ExitCode : int {
+  kStrictAccept = 0,
+  kRuntimeError = 1,
+  kUsableButNotStrict = 2,
+  kSolveFailed = 3,
+};
 
-template<typename T>
-Eigen::Matrix<T, 3, 3> rpyToRTemplate(const Eigen::Matrix<T, 3, 1> & rpy) {
-  const T roll = rpy.x();
-  const T pitch = rpy.y();
-  const T yaw = rpy.z();
-
-  Eigen::Matrix<T, 3, 3> Rx, Ry, Rz;
-  Rx << T(1), T(0), T(0),
-        T(0), ceres::cos(roll), -ceres::sin(roll),
-        T(0), ceres::sin(roll), ceres::cos(roll);
-
-  Ry << ceres::cos(pitch), T(0), ceres::sin(pitch),
-        T(0), T(1), T(0),
-        -ceres::sin(pitch), T(0), ceres::cos(pitch);
-
-  Rz << ceres::cos(yaw), -ceres::sin(yaw), T(0),
-        ceres::sin(yaw), ceres::cos(yaw), T(0),
-        T(0), T(0), T(1);
-
-  return Rz * Ry * Rx;
-}
-
-Matrix3d rpyToR(const Vector3d & rpy) {
-  return rpyToRTemplate<double>(rpy);
-}
-
-template<typename T>
-Eigen::Matrix<T, 3, 3> rodriguesTemplate(const Eigen::Matrix<T, 3, 1> & w) {
-  const T theta = ceres::sqrt(w.squaredNorm() + T(1e-18));
-  Eigen::Matrix<T, 3, 3> I = Eigen::Matrix<T, 3, 3>::Identity();
-  if constexpr (std::is_same_v<T, double>) {
-    if (std::abs(theta) < 1e-12) {
-      return I;
-    }
-  }
-  const Eigen::Matrix<T, 3, 1> k = w / theta;
-  Eigen::Matrix<T, 3, 3> K;
-  K << T(0), -k.z(), k.y(),
-       k.z(), T(0), -k.x(),
-      -k.y(), k.x(), T(0);
-  return I + ceres::sin(theta) * K + (T(1) - ceres::cos(theta)) * K * K;
-}
-
-Vector3d normalizeVec(const Vector3d & v) {
-  const double n = v.norm();
-  if (n < kEps) {
-    return v;
-  }
-  return v / n;
-}
-
-pair<Vector3d, double> transformPlaneToBody(
-  const Matrix3d & R, const Vector3d & t,
-  const Vector3d & n_lidar, double d_lidar)
-{
-  const Vector3d n_body = normalizeVec(R * n_lidar);
-  const double d_body = d_lidar - n_body.dot(t);
-  return {n_body, d_body};
-}
-
-pair<Vector3d, double> transformPlaneBodyToLidar(
-  const Matrix3d & R, const Vector3d & t,
-  const Vector3d & n_body, double d_body)
-{
-  const Vector3d n_lidar = normalizeVec(R.transpose() * n_body);
-  const double d_lidar = d_body + n_body.dot(t);
-  return {n_lidar, d_lidar};
-}
-
-Vector3d alignNormal(const Vector3d & n_meas, const Vector3d & n_prior) {
-  return (n_meas.dot(n_prior) < 0.0) ? -n_meas : n_meas;
-}
-
-double rad2deg(double r) {
-  return r * 180.0 / M_PI;
-}
-
-double deg2rad(double d) {
-  return d * M_PI / 180.0;
-}
-
-pair<Vector3d, double> orientPlaneTowardLidar(
-  const Vector3d & n_body_in, double d_body_in,
-  const Vector3d & lidar_pos_body)
-{
-  Vector3d n = normalizeVec(n_body_in);
-  double d = d_body_in;
-  const double side = n.dot(lidar_pos_body) + d;
-  if (side < 0.0) {
-    n = -n;
-    d = -d;
-  }
-  return {n, d};
-}
-
-string sanitizeIpToFrame(const string & ip) {
-  string out = "lidar_";
-  for (char c : ip) {
-    out.push_back(c == '.' ? '_' : c);
-  }
-  return out;
-}
-
-template<typename PointT>
-void finalizeCloud(typename pcl::PointCloud<PointT>::Ptr cloud) {
-  cloud->width = static_cast<uint32_t>(cloud->points.size());
-  cloud->height = 1;
-  cloud->is_dense = false;
-}
-
-pcl::PointXYZRGB makePointRGB(double x, double y, double z, uint8_t r, uint8_t g, uint8_t b) {
-  pcl::PointXYZRGB p;
-  p.x = static_cast<float>(x);
-  p.y = static_cast<float>(y);
-  p.z = static_cast<float>(z);
-  p.r = r;
-  p.g = g;
-  p.b = b;
-  return p;
-}
-
-double angleBetweenNormalsDeg(const Vector3d & a, const Vector3d & b) {
-  const double c = std::clamp(normalizeVec(a).dot(normalizeVec(b)), -1.0, 1.0);
-  return rad2deg(std::acos(c));
-}
+enum class LogLevel : int {
+  kInfo = 0,
+  kWarn = 1,
+  kError = 2,
+};
 
 struct RoiBox {
   double xmin{-std::numeric_limits<double>::infinity()};
@@ -188,44 +62,17 @@ struct RoiBox {
   double zmin{-std::numeric_limits<double>::infinity()};
   double zmax{ std::numeric_limits<double>::infinity()};
 
-  bool contains(double x, double y, double z) const {
-    return x >= xmin && x <= xmax &&
-           y >= ymin && y <= ymax &&
-           z >= zmin && z <= zmax;
-  }
-
   bool contains(const Vector3d & p) const {
-    return contains(p.x(), p.y(), p.z());
-  }
-
-  bool contains(const pcl::PointXYZ & pt) const {
-    return contains(static_cast<double>(pt.x), static_cast<double>(pt.y), static_cast<double>(pt.z));
+    return p.x() >= xmin && p.x() <= xmax &&
+           p.y() >= ymin && p.y() <= ymax &&
+           p.z() >= zmin && p.z() <= zmax;
   }
 };
 
 struct OrientedRoiBox {
   Vector3d center_lidar{0.0, 0.0, 0.0};
-  std::array<Vector3d, 3> axes_lidar{
-    Vector3d::UnitX(),
-    Vector3d::UnitY(),
-    Vector3d::UnitZ()
-  };
+  std::array<Vector3d, 3> axes_lidar{Vector3d::UnitX(), Vector3d::UnitY(), Vector3d::UnitZ()};
   Vector3d half_extents{0.0, 0.0, 0.0};
-
-  bool contains(const Vector3d & p_lidar) const {
-    const Vector3d q = p_lidar - center_lidar;
-    for (int i = 0; i < 3; ++i) {
-      const double local = q.dot(axes_lidar[i]);
-      if (std::abs(local) > half_extents[i]) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool contains(const pcl::PointXYZ & pt) const {
-    return contains(Vector3d(pt.x, pt.y, pt.z));
-  }
 };
 
 struct AxisAlignedRoiBox {
@@ -246,57 +93,258 @@ struct AxisAlignedRoiBox {
     return (p.array() >= min_corner.array()).all() &&
            (p.array() <= max_corner.array()).all();
   }
-
-  bool contains(const pcl::PointXYZ & pt) const {
-    return contains(Vector3d(pt.x, pt.y, pt.z));
-  }
 };
 
-OrientedRoiBox transformRoiBoxBodyToLidar(
-  const RoiBox & roi_body,
-  const Matrix3d & R_lidar_to_body,
-  const Vector3d & t_lidar_to_body)
-{
-  OrientedRoiBox roi_lidar;
+struct PlaneMeasurement {
+  std::size_t plane_index{0};
+  Vector3d n_lidar{0.0, 0.0, 1.0};
+  double d_lidar{0.0};
+  Vector3d n0_body{0.0, 0.0, 1.0};
+  double d0_body{0.0};
+  std::size_t roi_point_count{0};
+  std::size_t inlier_count{0};
+  bool prior_flipped{false};
+  bool meas_flipped{false};
+  double init_normal_angle_err_deg{0.0};
+  double init_plane_distance_err_m{0.0};
+};
 
-  const Vector3d center_body(
-    0.5 * (roi_body.xmin + roi_body.xmax),
-    0.5 * (roi_body.ymin + roi_body.ymax),
-    0.5 * (roi_body.zmin + roi_body.zmax));
-  roi_lidar.center_lidar = R_lidar_to_body.transpose() * (center_body - t_lidar_to_body);
+struct PerPlaneDiagnostics {
+  std::size_t plane_index{0};
+  Vector3d n_body_hat{0.0, 0.0, 1.0};
+  double d_body_hat{0.0};
+  double normal_angle_err_deg{0.0};
+  double plane_distance_err_m{0.0};
+};
 
-  roi_lidar.axes_lidar[0] = normalizeVec(R_lidar_to_body.transpose() * Vector3d::UnitX());
-  roi_lidar.axes_lidar[1] = normalizeVec(R_lidar_to_body.transpose() * Vector3d::UnitY());
-  roi_lidar.axes_lidar[2] = normalizeVec(R_lidar_to_body.transpose() * Vector3d::UnitZ());
+struct SolverResult {
+  bool success{false};
+  bool strict_accept{false};
+  std::string summary;
+  double initial_cost{0.0};
+  double final_cost{0.0};
+  Vector3d rpy_rad{0.0, 0.0, 0.0};
+  Vector3d t_m{0.0, 0.0, 0.0};
+  Matrix3d R{Matrix3d::Identity()};
+  int seed_index{-1};
+  std::vector<PerPlaneDiagnostics> per_plane;
+};
 
-  roi_lidar.half_extents = Vector3d(
-    0.5 * (roi_body.xmax - roi_body.xmin),
-    0.5 * (roi_body.ymax - roi_body.ymin),
-    0.5 * (roi_body.zmax - roi_body.zmin));
-  return roi_lidar;
+struct BoundsConfig {
+  double dtheta_deg{5.0};
+  double dD_m{0.05};
+  Vector3d t_xyz_m{0.10, 0.10, 0.10};
+  Vector3d rpy_deg{5.0, 5.0, 5.0};
+};
+
+struct GateConfig {
+  double max_normal_angle_error_deg{20.0};
+  double max_plane_distance_error_m{0.08};
+};
+
+struct AcceptanceConfig {
+  double strict_max_final_cost{5.0};
+  double strict_max_angle_error_deg{3.0};
+  double strict_max_distance_error_m{0.02};
+  double strict_max_translation_delta_m{0.10};
+  double strict_max_rotation_delta_deg{10.0};
+};
+
+struct SeedConfig {
+  double scale_fraction{0.4};
+  Vector3d max_rpy_deg{2.0, 2.0, 2.0};
+  Vector3d max_t_m{0.02, 0.02, 0.02};
+  bool enable_diagonal_seeds{true};
+};
+
+struct Config {
+  std::string lidar_ip;
+  std::string pcd_path;
+  std::string yaml_path;
+  std::string angle_unit_cli;
+  double ransac_distance_threshold{0.02};
+  int ransac_iterations{1000};
+  int min_plane_points{80};
+  double wn{10.0};
+  double wd{20.0};
+  double wp{2.0};
+  double wD{5.0};
+  int multi_seed_mode{1};
+  LogLevel log_level{LogLevel::kInfo};
+  BoundsConfig bounds;
+  GateConfig gates;
+  AcceptanceConfig acceptance;
+  SeedConfig seeds;
+};
+
+struct YamlInput {
+  std::string angle_unit{"deg"};
+  Vector3d t_init{0.0, 0.0, 0.0};
+  Vector3d rpy_init_rad{0.0, 0.0, 0.0};
+  Matrix3d R_init{Matrix3d::Identity()};
+  std::array<Vector4d, 3> planes_body;
+  std::array<RoiBox, 3> rois_body;
+};
+
+struct AlignedPlaneResult {
+  Vector3d n{0.0, 0.0, 1.0};
+  double d{0.0};
+  bool flipped{false};
+};
+
+struct RansacFitResult {
+  bool success{false};
+  Vector3d n{0.0, 0.0, 1.0};
+  double d{0.0};
+  pcl::PointIndices::Ptr inliers{new pcl::PointIndices()};
+};
+
+struct SeedOffset {
+  Vector3d rpy_offset_rad{0.0, 0.0, 0.0};
+  Vector3d t_offset_m{0.0, 0.0, 0.0};
+};
+
+[[noreturn]] void fail(const std::string & msg) {
+  throw std::runtime_error(msg);
 }
 
-std::array<Vector3d, 8> orientedRoiCornersLidar(const OrientedRoiBox & roi_lidar)
-{
+const char * logLevelTag(LogLevel level) {
+  switch (level) {
+    case LogLevel::kInfo: return "info";
+    case LogLevel::kWarn: return "warn";
+    case LogLevel::kError: return "error";
+  }
+  return "info";
+}
+
+bool shouldLog(LogLevel cur, LogLevel msg_level) {
+  return static_cast<int>(msg_level) >= static_cast<int>(cur);
+}
+
+void logMessage(const Config & cfg, LogLevel level, const std::string & msg) {
+  if (!shouldLog(cfg.log_level, level)) return;
+  std::ostream & os = (level == LogLevel::kError) ? std::cerr : std::cout;
+  os << "[" << logLevelTag(level) << "] " << msg << "\n";
+}
+
+double deg2rad(double deg) {
+  return deg * M_PI / 180.0;
+}
+
+double rad2deg(double rad) {
+  return rad * 180.0 / M_PI;
+}
+
+bool isFiniteVec(const Vector3d & v) {
+  return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
+bool isReasonablePoint(const Vector3d & v) {
+  return isFiniteVec(v) &&
+         std::abs(v.x()) < kMaxReasonablePointCoordAbs &&
+         std::abs(v.y()) < kMaxReasonablePointCoordAbs &&
+         std::abs(v.z()) < kMaxReasonablePointCoordAbs;
+}
+
+Vector3d normalizeVecOrFail(const Vector3d & v, const std::string & name) {
+  const double n = v.norm();
+  if (!std::isfinite(n) || n < kEps) {
+    fail(name + " norm is too small or invalid");
+  }
+  return v / n;
+}
+
+double clampDot(double x) {
+  return std::max(-1.0, std::min(1.0, x));
+}
+
+double angleBetweenNormalsDeg(const Vector3d & a, const Vector3d & b) {
+  const Vector3d an = normalizeVecOrFail(a, "normal a");
+  const Vector3d bn = normalizeVecOrFail(b, "normal b");
+  const double c = clampDot(an.dot(bn));
+  return rad2deg(std::acos(c));
+}
+
+template<typename T>
+Eigen::Matrix<T, 3, 3> rpyToRTemplate(const Eigen::Matrix<T, 3, 1> & rpy) {
+  const T roll = rpy.x();
+  const T pitch = rpy.y();
+  const T yaw = rpy.z();
+
+  Eigen::Matrix<T, 3, 3> Rx, Ry, Rz;
+  Rx << T(1), T(0), T(0),
+        T(0), ceres::cos(roll), -ceres::sin(roll),
+        T(0), ceres::sin(roll),  ceres::cos(roll);
+  Ry << ceres::cos(pitch), T(0), ceres::sin(pitch),
+        T(0), T(1), T(0),
+        -ceres::sin(pitch), T(0), ceres::cos(pitch);
+  Rz << ceres::cos(yaw), -ceres::sin(yaw), T(0),
+        ceres::sin(yaw),  ceres::cos(yaw), T(0),
+        T(0), T(0), T(1);
+  return Rz * Ry * Rx;
+}
+
+Matrix3d rpyToR(const Vector3d & rpy) {
+  return rpyToRTemplate<double>(rpy);
+}
+
+template<typename T>
+Eigen::Matrix<T, 3, 3> rodriguesTemplate(const Eigen::Matrix<T, 3, 1> & w) {
+  const T theta2 = w.squaredNorm();
+  if (theta2 < T(kSmallAngleThreshold)) {
+    return Eigen::Matrix<T, 3, 3>::Identity();
+  }
+  T R_arr[9];
+  const T angle_axis[3] = {w.x(), w.y(), w.z()};
+  ceres::AngleAxisToRotationMatrix(angle_axis, R_arr);
+  Eigen::Matrix<T, 3, 3> R;
+  R << R_arr[0], R_arr[1], R_arr[2],
+       R_arr[3], R_arr[4], R_arr[5],
+       R_arr[6], R_arr[7], R_arr[8];
+  return R;
+}
+
+std::array<Vector3d, 8> orientedRoiCornersLidar(const OrientedRoiBox & roi) {
   std::array<Vector3d, 8> corners;
   int idx = 0;
   for (int sx : {-1, 1}) {
     for (int sy : {-1, 1}) {
       for (int sz : {-1, 1}) {
-        corners[idx++] = roi_lidar.center_lidar
-          + static_cast<double>(sx) * roi_lidar.half_extents.x() * roi_lidar.axes_lidar[0]
-          + static_cast<double>(sy) * roi_lidar.half_extents.y() * roi_lidar.axes_lidar[1]
-          + static_cast<double>(sz) * roi_lidar.half_extents.z() * roi_lidar.axes_lidar[2];
+        corners[idx++] = roi.center_lidar
+          + static_cast<double>(sx) * roi.half_extents.x() * roi.axes_lidar[0]
+          + static_cast<double>(sy) * roi.half_extents.y() * roi.axes_lidar[1]
+          + static_cast<double>(sz) * roi.half_extents.z() * roi.axes_lidar[2];
       }
     }
   }
   return corners;
 }
 
-AxisAlignedRoiBox orientedRoiToAxisAlignedAabb(const OrientedRoiBox & roi_lidar)
+OrientedRoiBox transformRoiBoxBodyToLidar(
+  const RoiBox & roi_body,
+  const Matrix3d & R_lidar_to_body,
+  const Vector3d & t_lidar_to_body)
 {
+  OrientedRoiBox roi;
+  const Vector3d center_body(
+    0.5 * (roi_body.xmin + roi_body.xmax),
+    0.5 * (roi_body.ymin + roi_body.ymax),
+    0.5 * (roi_body.zmin + roi_body.zmax));
+
+  roi.center_lidar = R_lidar_to_body.transpose() * (center_body - t_lidar_to_body);
+  roi.axes_lidar[0] = normalizeVecOrFail(R_lidar_to_body.transpose() * Vector3d::UnitX(), "roi axis x");
+  roi.axes_lidar[1] = normalizeVecOrFail(R_lidar_to_body.transpose() * Vector3d::UnitY(), "roi axis y");
+  roi.axes_lidar[2] = normalizeVecOrFail(R_lidar_to_body.transpose() * Vector3d::UnitZ(), "roi axis z");
+  roi.half_extents = Vector3d(
+    0.5 * (roi_body.xmax - roi_body.xmin),
+    0.5 * (roi_body.ymax - roi_body.ymin),
+    0.5 * (roi_body.zmax - roi_body.zmin));
+  return roi;
+}
+
+AxisAlignedRoiBox orientedRoiToAabb(const OrientedRoiBox & roi) {
   AxisAlignedRoiBox aabb;
-  const auto corners = orientedRoiCornersLidar(roi_lidar);
+  const auto corners = orientedRoiCornersLidar(roi);
   for (const auto & c : corners) {
     aabb.min_corner = aabb.min_corner.cwiseMin(c);
     aabb.max_corner = aabb.max_corner.cwiseMax(c);
@@ -304,107 +352,455 @@ AxisAlignedRoiBox orientedRoiToAxisAlignedAabb(const OrientedRoiBox & roi_lidar)
   return aabb;
 }
 
-AxisAlignedRoiBox unionAxisAlignedAabb(const vector<AxisAlignedRoiBox> & boxes)
-{
+AxisAlignedRoiBox unionAabb(const std::vector<AxisAlignedRoiBox> & boxes) {
   AxisAlignedRoiBox out;
   bool has_any = false;
   for (const auto & box : boxes) {
-    if (!box.isValid()) {
-      continue;
-    }
+    if (!box.isValid()) continue;
     if (!has_any) {
       out = box;
       has_any = true;
-      continue;
+    } else {
+      out.min_corner = out.min_corner.cwiseMin(box.min_corner);
+      out.max_corner = out.max_corner.cwiseMax(box.max_corner);
     }
-    out.min_corner = out.min_corner.cwiseMin(box.min_corner);
-    out.max_corner = out.max_corner.cwiseMax(box.max_corner);
   }
   return out;
 }
 
-
-std::array<Vector3d, 8> bodyRoiCorners(const RoiBox & roi_body)
+std::pair<Vector3d, double> transformPlaneToBody(
+  const Matrix3d & R,
+  const Vector3d & t,
+  const Vector3d & n_lidar,
+  double d_lidar)
 {
-  return {
-    Vector3d(roi_body.xmin, roi_body.ymin, roi_body.zmin),
-    Vector3d(roi_body.xmax, roi_body.ymin, roi_body.zmin),
-    Vector3d(roi_body.xmax, roi_body.ymax, roi_body.zmin),
-    Vector3d(roi_body.xmin, roi_body.ymax, roi_body.zmin),
-    Vector3d(roi_body.xmin, roi_body.ymin, roi_body.zmax),
-    Vector3d(roi_body.xmax, roi_body.ymin, roi_body.zmax),
-    Vector3d(roi_body.xmax, roi_body.ymax, roi_body.zmax),
-    Vector3d(roi_body.xmin, roi_body.ymax, roi_body.zmax)
-  };
+  const Vector3d n_body = normalizeVecOrFail(R * n_lidar, "transformPlaneToBody normal");
+  const double d_body = d_lidar - n_body.dot(t);
+  return {n_body, d_body};
 }
 
-struct PlaneMeasurement {
-  Vector3d n_lidar;
-  double d_lidar{0.0};
-  Vector3d N0_body;
-  double D0_body{0.0};  // plane prior in form N^T p = D
-  std::size_t plane_index{0};
-  std::size_t union_aabb_point_count{0};
-  std::size_t body_roi_hit_count{0};
-  std::size_t inlier_count{0};
-  bool prior_flipped{false};
-  Vector3d prior_input_normal;
-  double prior_input_d_body_std{0.0};
-  Vector3d prior_oriented_normal;
-  double prior_oriented_d_body_std{0.0};
-  std::size_t roi_point_count{0};
-  bool bbox_used{false};
-  std::optional<RoiBox> roi_box;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr roi_cloud;
-};
+std::pair<Vector3d, double> transformPlaneBodyToLidar(
+  const Matrix3d & R,
+  const Vector3d & t,
+  const Vector3d & n_body,
+  double d_body)
+{
+  const Vector3d n_lidar = normalizeVecOrFail(R.transpose() * n_body, "transformPlaneBodyToLidar normal");
+  const double d_lidar = d_body + n_body.dot(t);
+  return {n_lidar, d_lidar};
+}
 
-struct PlaneDiagnostic {
-  std::size_t plane_index{0};
-  double dtheta_rad_norm{0.0};
-  double dtheta_deg_norm{0.0};
-  Vector3d dtheta_rad{0.0, 0.0, 0.0};
-  double dD_m{0.0};
-  double normal_angle_error_deg{0.0};
-  double distance_error_m{0.0};
-  double mean_abs_body_plane_dist_m{0.0};
-  double max_abs_body_plane_dist_m{0.0};
-};
+std::pair<Vector3d, double> orientPlaneTowardLidar(
+  const Vector3d & n_body_in,
+  double d_body_in,
+  const Vector3d & lidar_pos_body)
+{
+  Vector3d n = normalizeVecOrFail(n_body_in, "orientPlaneTowardLidar input normal");
+  double d = d_body_in;
+  const Vector3d p0 = -d * n;
+  const Vector3d toward_lidar = lidar_pos_body - p0;
+  if (n.dot(toward_lidar) < 0.0) {
+    n = -n;
+    d = -d;
+  }
+  return {n, d};
+}
 
-struct CandidateSolution {
-  Vector3d rpy_opt;
-  Vector3d t_opt;
-  Matrix3d R_opt;
-  std::size_t union_aabb_point_count{0};
-  double initial_cost{0.0};
-  double final_cost{0.0};
-  bool numeric_success{false};
-  bool strict_success{false};
-  string summary;
-  string strict_failure_reason;
-  vector<std::array<double, 3>> dtheta_opt;
-  vector<double> dD_opt;
-  vector<PlaneMeasurement> used_measurements;
-  vector<PlaneDiagnostic> plane_diagnostics;
-  int seed_index{0};
-};
+AlignedPlaneResult alignPlaneToPrior(
+  const Vector3d & n_meas_in,
+  double d_meas_in,
+  const Vector3d & n_prior_in)
+{
+  AlignedPlaneResult out;
+  out.n = normalizeVecOrFail(n_meas_in, "alignPlaneToPrior measured normal");
+  out.d = d_meas_in;
+  if (out.n.dot(normalizeVecOrFail(n_prior_in, "alignPlaneToPrior prior normal")) < 0.0) {
+    out.n = -out.n;
+    out.d = -out.d;
+    out.flipped = true;
+  }
+  return out;
+}
 
-struct DynamicRefineResult {
-  bool attempted{false};
-  bool success{false};
-  string message;
-};
+std::string planeEquationStr(const Vector3d & n, double d) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(6)
+      << n.x() << " * x + "
+      << n.y() << " * y + "
+      << n.z() << " * z + "
+      << d << " = 0";
+  return oss.str();
+}
+
+RansacFitResult fitPlaneRansac(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+  double distance_threshold,
+  int max_iterations)
+{
+  RansacFitResult out;
+  if (!cloud || cloud->size() < 3) return out;
+
+  pcl::SACSegmentation<pcl::PointXYZ> seg;
+  seg.setOptimizeCoefficients(true);
+  seg.setModelType(pcl::SACMODEL_PLANE);
+  seg.setMethodType(pcl::SAC_RANSAC);
+  seg.setDistanceThreshold(distance_threshold);
+  seg.setMaxIterations(max_iterations);
+  seg.setInputCloud(cloud);
+
+  pcl::PointIndices::Ptr inliers(new pcl::PointIndices());
+  pcl::ModelCoefficients coeff;
+  seg.segment(*inliers, coeff);
+
+  if (inliers->indices.size() < 3 || coeff.values.size() != 4) return out;
+
+  Vector3d n(coeff.values[0], coeff.values[1], coeff.values[2]);
+  const double norm = n.norm();
+  if (norm < kEps || !std::isfinite(norm)) return out;
+
+  out.success = true;
+  out.n = n / norm;
+  out.d = static_cast<double>(coeff.values[3]) / norm;
+  out.inliers = inliers;
+  return out;
+}
+
+bool fitPlaneLSE(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+  const pcl::PointIndices::Ptr & inliers,
+  Vector3d & n_fit,
+  double & d_fit)
+{
+  if (!cloud || !inliers || inliers->indices.size() < 3) return false;
+
+  Eigen::MatrixXd X(inliers->indices.size(), 3);
+  for (std::size_t i = 0; i < inliers->indices.size(); ++i) {
+    const auto & pt = cloud->points[inliers->indices[i]];
+    X(static_cast<Eigen::Index>(i), 0) = static_cast<double>(pt.x);
+    X(static_cast<Eigen::Index>(i), 1) = static_cast<double>(pt.y);
+    X(static_cast<Eigen::Index>(i), 2) = static_cast<double>(pt.z);
+  }
+
+  const Vector3d centroid = X.colwise().mean();
+  Eigen::MatrixXd Xc = X.rowwise() - centroid.transpose();
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Xc, Eigen::ComputeThinV);
+  Vector3d n = svd.matrixV().col(2);
+  const double norm = n.norm();
+  if (norm < kEps || !std::isfinite(norm)) return false;
+
+  n /= norm;
+  n_fit = n;
+  d_fit = -n.dot(centroid);
+  return std::isfinite(d_fit) && isFiniteVec(n_fit);
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr loadPcd(const std::string & path) {
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+  if (pcl::io::loadPCDFile(path, *cloud) != 0) {
+    fail("failed to load pcd: " + path);
+  }
+  if (cloud->empty()) {
+    fail("pcd is empty: " + path);
+  }
+  return cloud;
+}
+
+RoiBox parseRoiBox(const YAML::Node & node) {
+  if (!node || !node.IsMap()) {
+    fail("plane_rois entry must be a map with xmin/xmax/ymin/ymax/zmin/zmax");
+  }
+  RoiBox roi;
+  roi.xmin = node["xmin"].as<double>();
+  roi.xmax = node["xmax"].as<double>();
+  roi.ymin = node["ymin"].as<double>();
+  roi.ymax = node["ymax"].as<double>();
+  roi.zmin = node["zmin"].as<double>();
+  roi.zmax = node["zmax"].as<double>();
+  if (!(std::isfinite(roi.xmin) && std::isfinite(roi.xmax) &&
+        std::isfinite(roi.ymin) && std::isfinite(roi.ymax) &&
+        std::isfinite(roi.zmin) && std::isfinite(roi.zmax))) {
+    fail("ROI bounds must be finite");
+  }
+  if (roi.xmin > roi.xmax || roi.ymin > roi.ymax || roi.zmin > roi.zmax) {
+    fail("invalid ROI bounds: require xmin<=xmax, ymin<=ymax, zmin<=zmax");
+  }
+  return roi;
+}
+
+double readAngleWithUnit(const YAML::Node & parent, const char * key, const std::string & angle_unit) {
+  if (!parent[key]) fail(std::string("missing angle field: ") + key);
+  const double v = parent[key].as<double>();
+  if (angle_unit == "deg") return deg2rad(v);
+  if (angle_unit == "rad") return v;
+  fail("angle_unit must be 'deg' or 'rad'");
+}
+
+void validateNonNegative(const std::string & name, double value) {
+  if (!std::isfinite(value) || value < 0.0) {
+    fail(name + " must be finite and >= 0");
+  }
+}
+
+void validateConfig(const Config & cfg) {
+  validateNonNegative("ransac_distance_threshold", cfg.ransac_distance_threshold);
+  if (cfg.ransac_iterations <= 0) fail("ransac_iterations must be > 0");
+  if (cfg.min_plane_points < 3) fail("min_plane_points must be >= 3");
+  validateNonNegative("wn", cfg.wn);
+  validateNonNegative("wd", cfg.wd);
+  validateNonNegative("wp", cfg.wp);
+  validateNonNegative("wD", cfg.wD);
+  validateNonNegative("bounds.dtheta_deg", cfg.bounds.dtheta_deg);
+  validateNonNegative("bounds.dD_m", cfg.bounds.dD_m);
+  for (int i = 0; i < 3; ++i) {
+    validateNonNegative("bounds.t_xyz_m", cfg.bounds.t_xyz_m[i]);
+    validateNonNegative("bounds.rpy_deg", cfg.bounds.rpy_deg[i]);
+    validateNonNegative("seed.scale_fraction", cfg.seeds.scale_fraction);
+    validateNonNegative("seed.max_rpy_deg", cfg.seeds.max_rpy_deg[i]);
+    validateNonNegative("seed.max_t_m", cfg.seeds.max_t_m[i]);
+  }
+  validateNonNegative("gates.max_normal_angle_error_deg", cfg.gates.max_normal_angle_error_deg);
+  validateNonNegative("gates.max_plane_distance_error_m", cfg.gates.max_plane_distance_error_m);
+  validateNonNegative("acceptance.strict_max_final_cost", cfg.acceptance.strict_max_final_cost);
+  validateNonNegative("acceptance.strict_max_angle_error_deg", cfg.acceptance.strict_max_angle_error_deg);
+  validateNonNegative("acceptance.strict_max_distance_error_m", cfg.acceptance.strict_max_distance_error_m);
+  validateNonNegative("acceptance.strict_max_translation_delta_m", cfg.acceptance.strict_max_translation_delta_m);
+  validateNonNegative("acceptance.strict_max_rotation_delta_deg", cfg.acceptance.strict_max_rotation_delta_deg);
+  if (cfg.multi_seed_mode < 0) fail("multi_seed_mode must be >= 0");
+}
+
+void loadYamlOptionalConfig(const YAML::Node & node, Config & cfg) {
+  if (node["bounds"]) {
+    const auto b = node["bounds"];
+    if (b["dtheta_deg"]) cfg.bounds.dtheta_deg = b["dtheta_deg"].as<double>();
+    if (b["dD_m"]) cfg.bounds.dD_m = b["dD_m"].as<double>();
+    if (b["t_xyz_m"]) {
+      const auto a = b["t_xyz_m"].as<std::vector<double>>();
+      if (a.size() != 3) fail("bounds.t_xyz_m must have 3 elements");
+      cfg.bounds.t_xyz_m = Vector3d(a[0], a[1], a[2]);
+    }
+    if (b["rpy_deg"]) {
+      const auto a = b["rpy_deg"].as<std::vector<double>>();
+      if (a.size() != 3) fail("bounds.rpy_deg must have 3 elements");
+      cfg.bounds.rpy_deg = Vector3d(a[0], a[1], a[2]);
+    }
+  }
+  if (node["gates"]) {
+    const auto g = node["gates"];
+    if (g["max_normal_angle_error_deg"]) cfg.gates.max_normal_angle_error_deg = g["max_normal_angle_error_deg"].as<double>();
+    if (g["max_plane_distance_error_m"]) cfg.gates.max_plane_distance_error_m = g["max_plane_distance_error_m"].as<double>();
+  }
+  if (node["acceptance"]) {
+    const auto a = node["acceptance"];
+    if (a["strict_max_final_cost"]) cfg.acceptance.strict_max_final_cost = a["strict_max_final_cost"].as<double>();
+    if (a["strict_max_angle_error_deg"]) cfg.acceptance.strict_max_angle_error_deg = a["strict_max_angle_error_deg"].as<double>();
+    if (a["strict_max_distance_error_m"]) cfg.acceptance.strict_max_distance_error_m = a["strict_max_distance_error_m"].as<double>();
+    if (a["strict_max_translation_delta_m"]) cfg.acceptance.strict_max_translation_delta_m = a["strict_max_translation_delta_m"].as<double>();
+    if (a["strict_max_rotation_delta_deg"]) cfg.acceptance.strict_max_rotation_delta_deg = a["strict_max_rotation_delta_deg"].as<double>();
+  }
+  if (node["multi_seed_mode"]) cfg.multi_seed_mode = node["multi_seed_mode"].as<int>();
+  if (node["seed_config"]) {
+    const auto s = node["seed_config"];
+    if (s["scale_fraction"]) cfg.seeds.scale_fraction = s["scale_fraction"].as<double>();
+    if (s["max_rpy_deg"]) {
+      const auto a = s["max_rpy_deg"].as<std::vector<double>>();
+      if (a.size() != 3) fail("seed_config.max_rpy_deg must have 3 elements");
+      cfg.seeds.max_rpy_deg = Vector3d(a[0], a[1], a[2]);
+    }
+    if (s["max_t_m"]) {
+      const auto a = s["max_t_m"].as<std::vector<double>>();
+      if (a.size() != 3) fail("seed_config.max_t_m must have 3 elements");
+      cfg.seeds.max_t_m = Vector3d(a[0], a[1], a[2]);
+    }
+    if (s["enable_diagonal_seeds"]) cfg.seeds.enable_diagonal_seeds = s["enable_diagonal_seeds"].as<bool>();
+  }
+}
+
+YamlInput loadYamlInput(const std::string & yaml_path, const std::string & lidar_ip, Config & cfg) {
+  const YAML::Node root = YAML::LoadFile(yaml_path);
+  if (!root[lidar_ip]) {
+    fail("lidar ip not found in yaml: " + lidar_ip);
+  }
+  const YAML::Node node = root[lidar_ip];
+
+  YamlInput out;
+  out.angle_unit = cfg.angle_unit_cli.empty()
+      ? (node["angle_unit"] ? node["angle_unit"].as<std::string>() : std::string("deg"))
+      : cfg.angle_unit_cli;
+  loadYamlOptionalConfig(node, cfg);
+  validateConfig(cfg);
+
+  out.t_init = Vector3d(node["x"].as<double>(), node["y"].as<double>(), node["z"].as<double>());
+  out.rpy_init_rad = Vector3d(
+    readAngleWithUnit(node, "roll", out.angle_unit),
+    readAngleWithUnit(node, "pitch", out.angle_unit),
+    readAngleWithUnit(node, "yaw", out.angle_unit));
+  out.R_init = rpyToR(out.rpy_init_rad);
+
+  const YAML::Node planes = node["planes"];
+  const YAML::Node rois = node["plane_rois"];
+  if (!planes || !planes.IsSequence() || planes.size() < 3) {
+    fail("yaml must contain at least 3 planes");
+  }
+  if (!rois || !rois.IsSequence() || rois.size() < 3) {
+    fail("yaml must contain at least 3 plane_rois");
+  }
+
+  for (std::size_t i = 0; i < 3; ++i) {
+    const auto coeff = planes[i].as<std::vector<double>>();
+    if (coeff.size() != 4) fail("plane entry must be [a,b,c,d]");
+    Vector4d p(coeff[0], coeff[1], coeff[2], coeff[3]);
+    const double norm = p.head<3>().norm();
+    if (norm < kEps || !std::isfinite(norm)) fail("plane normal norm too small");
+    out.planes_body[i] = Vector4d(p[0] / norm, p[1] / norm, p[2] / norm, p[3] / norm);
+    out.rois_body[i] = parseRoiBox(rois[i]);
+  }
+  return out;
+}
+
+std::vector<PlaneMeasurement> extractPlaneMeasurements(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud,
+  const YamlInput & yin,
+  const Config & cfg)
+{
+  std::vector<OrientedRoiBox> rois_lidar;
+  std::vector<AxisAlignedRoiBox> rois_aabb;
+  rois_lidar.reserve(3);
+  rois_aabb.reserve(3);
+
+  for (std::size_t i = 0; i < 3; ++i) {
+    const auto roi_lidar = transformRoiBoxBodyToLidar(yin.rois_body[i], yin.R_init, yin.t_init);
+    rois_lidar.push_back(roi_lidar);
+    rois_aabb.push_back(orientedRoiToAabb(roi_lidar));
+  }
+
+  const AxisAlignedRoiBox union_box = unionAabb(rois_aabb);
+  if (!union_box.isValid()) fail("invalid union AABB from 3 ROIs");
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr union_cloud_lidar(new pcl::PointCloud<pcl::PointXYZ>());
+  std::vector<Vector3d> union_points_body;
+  union_points_body.reserve(raw_cloud->size());
+
+  for (const auto & pt : raw_cloud->points) {
+    if (!pcl::isFinite(pt)) continue;
+    const Vector3d p_lidar(pt.x, pt.y, pt.z);
+    if (!isReasonablePoint(p_lidar)) continue;
+    if (!union_box.contains(p_lidar)) continue;
+    const Vector3d p_body = yin.R_init * p_lidar + yin.t_init;
+    if (!isReasonablePoint(p_body)) continue;
+    union_cloud_lidar->points.push_back(pt);
+    union_points_body.push_back(p_body);
+  }
+
+  union_cloud_lidar->width = static_cast<uint32_t>(union_cloud_lidar->points.size());
+  union_cloud_lidar->height = 1;
+  union_cloud_lidar->is_dense = false;
+
+  if (union_cloud_lidar->empty()) fail("no points inside union AABB");
+
+  {
+    std::ostringstream oss;
+    oss << "union lidar AABB min=" << union_box.min_corner.transpose()
+        << ", max=" << union_box.max_corner.transpose();
+    logMessage(cfg, LogLevel::kInfo, oss.str());
+  }
+  {
+    std::ostringstream oss;
+    oss << "raw points=" << raw_cloud->size() << " union_aabb_points=" << union_cloud_lidar->size();
+    logMessage(cfg, LogLevel::kInfo, oss.str());
+  }
+
+  std::vector<PlaneMeasurement> measurements;
+  measurements.reserve(3);
+
+  for (std::size_t i = 0; i < 3; ++i) {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr roi_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    for (std::size_t k = 0; k < union_cloud_lidar->points.size(); ++k) {
+      if (yin.rois_body[i].contains(union_points_body[k])) {
+        roi_cloud->points.push_back(union_cloud_lidar->points[k]);
+      }
+    }
+    roi_cloud->width = static_cast<uint32_t>(roi_cloud->points.size());
+    roi_cloud->height = 1;
+    roi_cloud->is_dense = false;
+
+    {
+      std::ostringstream oss;
+      oss << "roi " << i << ": body hit points=" << roi_cloud->size();
+      logMessage(cfg, LogLevel::kInfo, oss.str());
+    }
+    if (static_cast<int>(roi_cloud->size()) < cfg.min_plane_points) {
+      fail("roi " + std::to_string(i) + " has too few points for plane fitting");
+    }
+
+    const auto ransac_fit = fitPlaneRansac(roi_cloud, cfg.ransac_distance_threshold, cfg.ransac_iterations);
+    if (!ransac_fit.success) fail("RANSAC failed for roi " + std::to_string(i));
+
+    Vector3d n_fit = ransac_fit.n;
+    double d_fit = ransac_fit.d;
+    if (!fitPlaneLSE(roi_cloud, ransac_fit.inliers, n_fit, d_fit)) {
+      fail("LSE refine failed for roi " + std::to_string(i));
+    }
+
+    const Vector4d prior_plane = yin.planes_body[i];
+    const Vector3d prior_input_n = normalizeVecOrFail(prior_plane.head<3>(), "yaml prior plane normal");
+    const double prior_input_d = prior_plane[3];
+    const auto oriented_prior = orientPlaneTowardLidar(prior_input_n, prior_input_d, yin.t_init);
+    const bool prior_flipped = oriented_prior.first.dot(prior_input_n) < 0.0;
+
+    const auto pred_lidar_plane = transformPlaneBodyToLidar(
+      yin.R_init, yin.t_init, oriented_prior.first, oriented_prior.second);
+    const auto aligned_meas = alignPlaneToPrior(n_fit, d_fit, pred_lidar_plane.first);
+
+    const double init_normal_angle_err_deg = angleBetweenNormalsDeg(aligned_meas.n, pred_lidar_plane.first);
+    const double init_plane_distance_err_m = std::abs(aligned_meas.d - pred_lidar_plane.second);
+    if (init_normal_angle_err_deg > cfg.gates.max_normal_angle_error_deg) {
+      fail("roi " + std::to_string(i) + " normal angle error too large: " + std::to_string(init_normal_angle_err_deg) + " deg");
+    }
+    if (init_plane_distance_err_m > cfg.gates.max_plane_distance_error_m) {
+      fail("roi " + std::to_string(i) + " plane distance error too large: " + std::to_string(init_plane_distance_err_m) + " m");
+    }
+
+    PlaneMeasurement m;
+    m.plane_index = i;
+    m.n_lidar = aligned_meas.n;
+    m.d_lidar = aligned_meas.d;
+    m.n0_body = oriented_prior.first;
+    m.d0_body = oriented_prior.second;
+    m.roi_point_count = roi_cloud->size();
+    m.inlier_count = ransac_fit.inliers->indices.size();
+    m.prior_flipped = prior_flipped;
+    m.meas_flipped = aligned_meas.flipped;
+    m.init_normal_angle_err_deg = init_normal_angle_err_deg;
+    m.init_plane_distance_err_m = init_plane_distance_err_m;
+    measurements.push_back(m);
+
+    std::ostringstream oss;
+    oss << "plane " << i
+        << ": nL=" << m.n_lidar.transpose()
+        << " dL=" << std::fixed << std::setprecision(6) << m.d_lidar
+        << " inliers=" << m.inlier_count
+        << " prior_flipped=" << (m.prior_flipped ? "true" : "false")
+        << " meas_flipped=" << (m.meas_flipped ? "true" : "false")
+        << " d0=" << m.d0_body
+        << " init_angle_err_deg=" << m.init_normal_angle_err_deg
+        << " init_dist_err_m=" << m.init_plane_distance_err_m;
+    logMessage(cfg, LogLevel::kInfo, oss.str());
+  }
+
+  return measurements;
+}
 
 struct PlaneResidual {
   PlaneResidual(
     const Vector3d & n_lidar_meas,
     double d_lidar_meas,
-    const Vector3d & N0_body_prior,
-    double D0_body_prior,
+    const Vector3d & n0_body_prior,
+    double d0_body_prior,
     double wn,
     double wd,
     double wp,
     double wD)
-  : nL_(n_lidar_meas), dL_(d_lidar_meas), N0_(N0_body_prior), D0_(D0_body_prior),
+  : nL_(n_lidar_meas), dL_(d_lidar_meas), n0_(n0_body_prior), d0_(d0_body_prior),
     wn_(wn), wd_(wd), wp_(wp), wD_(wD) {}
 
   template<typename T>
@@ -416,30 +812,21 @@ struct PlaneResidual {
     const Eigen::Matrix<T, 3, 1> dtheta_v(dtheta[0], dtheta[1], dtheta[2]);
 
     const Eigen::Matrix<T, 3, 3> R = rpyToRTemplate<T>(rpy_v);
-
-    const Eigen::Matrix<T, 3, 1> nL = nL_.cast<T>();
-    const Eigen::Matrix<T, 3, 1> N0 = N0_.cast<T>();
-    const T dL = T(dL_);
-    const T D0 = T(D0_);
-
     const Eigen::Matrix<T, 3, 3> R_delta = rodriguesTemplate<T>(dtheta_v);
-    Eigen::Matrix<T, 3, 1> Ni = R_delta * N0;
-    const T Ni_norm = ceres::sqrt(Ni.squaredNorm() + T(1e-12));
-    Ni /= Ni_norm;
-    const T Di = D0 + dD[0];
 
-    Eigen::Matrix<T, 3, 1> nB_hat = R * nL;
-    const T nB_hat_norm = ceres::sqrt(nB_hat.squaredNorm() + T(1e-12));
-    nB_hat /= nB_hat_norm;
-    const T dB_hat = dL - nB_hat.dot(t_v);
+    Eigen::Matrix<T, 3, 1> ni = R_delta * n0_.cast<T>();
+    ni /= ceres::sqrt(ni.squaredNorm() + T(1e-12));
+    const T di = T(d0_) + dD[0];
 
-    // 第二轮修改：法向残差从分量差改为叉乘残差，更直接约束方向一致性
-    const Eigen::Matrix<T, 3, 1> cross_err = nB_hat.cross(Ni);
+    Eigen::Matrix<T, 3, 1> n_body_hat = R * nL_.cast<T>();
+    n_body_hat /= ceres::sqrt(n_body_hat.squaredNorm() + T(1e-12));
+    const T d_body_hat = T(dL_) - n_body_hat.dot(t_v);
+
+    const Eigen::Matrix<T, 3, 1> cross_err = n_body_hat.cross(ni);
     residuals[0] = T(wn_) * cross_err[0];
     residuals[1] = T(wn_) * cross_err[1];
     residuals[2] = T(wn_) * cross_err[2];
-
-    residuals[3] = T(wd_) * (dB_hat + Di);
+    residuals[3] = T(wd_) * (d_body_hat - di);
     residuals[4] = T(wp_) * dtheta[0];
     residuals[5] = T(wp_) * dtheta[1];
     residuals[6] = T(wp_) * dtheta[2];
@@ -450,1570 +837,709 @@ struct PlaneResidual {
   static ceres::CostFunction * Create(
     const Vector3d & n_lidar_meas,
     double d_lidar_meas,
-    const Vector3d & N0_body_prior,
-    double D0_body_prior,
+    const Vector3d & n0_body_prior,
+    double d0_body_prior,
     double wn,
     double wd,
     double wp,
     double wD)
   {
     return new ceres::AutoDiffCostFunction<PlaneResidual, 8, 3, 3, 3, 1>(
-      new PlaneResidual(
-        n_lidar_meas, d_lidar_meas, N0_body_prior, D0_body_prior, wn, wd, wp, wD));
+      new PlaneResidual(n_lidar_meas, d_lidar_meas, n0_body_prior, d0_body_prior, wn, wd, wp, wD));
   }
 
   Vector3d nL_;
   double dL_;
-  Vector3d N0_;
-  double D0_;
+  Vector3d n0_;
+  double d0_;
   double wn_;
   double wd_;
   double wp_;
   double wD_;
 };
 
-struct LidarConfig {
-  string ip;
-  string topic;
-  double x{0.0};
-  double y{0.0};
-  double z{0.0};
-  double roll{0.0};
-  double pitch{0.0};
-  double yaw{0.0};
-  vector<Vector4d> planes;  // Ax+By+Cz+D=0 in body frame.
-  vector<std::optional<RoiBox>> plane_rois;
-};
+std::vector<PerPlaneDiagnostics> evaluatePerPlaneDiagnostics(
+  const std::vector<PlaneMeasurement> & measurements,
+  const SolverResult & result)
+{
+  std::vector<PerPlaneDiagnostics> out;
+  out.reserve(measurements.size());
+  for (const auto & m : measurements) {
+    const auto body_plane = transformPlaneToBody(result.R, result.t_m, m.n_lidar, m.d_lidar);
+    PerPlaneDiagnostics d;
+    d.plane_index = m.plane_index;
+    d.n_body_hat = body_plane.first;
+    d.d_body_hat = body_plane.second;
+    d.normal_angle_err_deg = angleBetweenNormalsDeg(body_plane.first, m.n0_body);
+    d.plane_distance_err_m = std::abs(body_plane.second - m.d0_body);
+    out.push_back(d);
+  }
+  return out;
+}
 
-struct LidarState {
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated{new pcl::PointCloud<pcl::PointXYZ>()};
-  rclcpp::Time accumulation_start{0, 0, RCL_ROS_TIME};
-  bool started{false};
-  bool calibrated{false};
-};
+bool passesStrictAcceptance(
+  const SolverResult & result,
+  const std::vector<PlaneMeasurement> & measurements,
+  const YamlInput & yin,
+  const Config & cfg)
+{
+  if (!result.success) return false;
+  if (result.final_cost > cfg.acceptance.strict_max_final_cost) return false;
+  if ((result.t_m - yin.t_init).norm() > cfg.acceptance.strict_max_translation_delta_m) return false;
+  if (rad2deg((result.rpy_rad - yin.rpy_init_rad).norm()) > cfg.acceptance.strict_max_rotation_delta_deg) return false;
+  for (const auto & d : result.per_plane) {
+    if (d.normal_angle_err_deg > cfg.acceptance.strict_max_angle_error_deg) return false;
+    if (d.plane_distance_err_m > cfg.acceptance.strict_max_distance_error_m) return false;
+  }
+  return result.per_plane.size() == measurements.size();
+}
 
+std::vector<SeedOffset> buildSeedOffsets(const Config & cfg) {
+  std::vector<SeedOffset> seeds;
+  seeds.push_back({});
+  if (cfg.multi_seed_mode == 0) return seeds;
+
+  Vector3d r_deg = cfg.bounds.rpy_deg * cfg.seeds.scale_fraction;
+  Vector3d t_m = cfg.bounds.t_xyz_m * cfg.seeds.scale_fraction;
+  for (int i = 0; i < 3; ++i) {
+    r_deg[i] = std::min(r_deg[i], cfg.seeds.max_rpy_deg[i]);
+    t_m[i] = std::min(t_m[i], cfg.seeds.max_t_m[i]);
+  }
+  const Vector3d r_rad(deg2rad(r_deg.x()), deg2rad(r_deg.y()), deg2rad(r_deg.z()));
+
+  auto push_axis_pair = [&](int axis) {
+    if (r_rad[axis] > 0.0) {
+      SeedOffset sp, sn;
+      sp.rpy_offset_rad[axis] =  r_rad[axis];
+      sn.rpy_offset_rad[axis] = -r_rad[axis];
+      seeds.push_back(sp);
+      seeds.push_back(sn);
+    }
+    if (t_m[axis] > 0.0) {
+      SeedOffset sp, sn;
+      sp.t_offset_m[axis] =  t_m[axis];
+      sn.t_offset_m[axis] = -t_m[axis];
+      seeds.push_back(sp);
+      seeds.push_back(sn);
+    }
+  };
+
+  for (int axis = 0; axis < 3; ++axis) push_axis_pair(axis);
+
+  if (cfg.seeds.enable_diagonal_seeds) {
+    for (int sx : {-1, 1}) {
+      for (int sy : {-1, 1}) {
+        SeedOffset s;
+        s.rpy_offset_rad = Vector3d(sx * r_rad.x(), sy * r_rad.y(), 0.0);
+        if (s.rpy_offset_rad.norm() > 0.0) seeds.push_back(s);
+      }
+    }
+    for (int sx : {-1, 1}) {
+      for (int sy : {-1, 1}) {
+        SeedOffset s;
+        s.t_offset_m = Vector3d(sx * t_m.x(), sy * t_m.y(), 0.0);
+        if (s.t_offset_m.norm() > 0.0) seeds.push_back(s);
+      }
+    }
+  }
+  return seeds;
+}
+
+SolverResult solveSingleSeed(
+  const std::vector<PlaneMeasurement> & measurements,
+  const YamlInput & yin,
+  const Config & cfg,
+  const SeedOffset & seed,
+  int seed_index)
+{
+  double rpy[3] = {
+    yin.rpy_init_rad.x() + seed.rpy_offset_rad.x(),
+    yin.rpy_init_rad.y() + seed.rpy_offset_rad.y(),
+    yin.rpy_init_rad.z() + seed.rpy_offset_rad.z()};
+  double t[3] = {
+    yin.t_init.x() + seed.t_offset_m.x(),
+    yin.t_init.y() + seed.t_offset_m.y(),
+    yin.t_init.z() + seed.t_offset_m.z()};
+  std::vector<std::array<double, 3>> dtheta_blocks(3, {0.0, 0.0, 0.0});
+  std::vector<double> dD_blocks(3, 0.0);
+
+  ceres::Problem problem;
+  for (std::size_t i = 0; i < measurements.size(); ++i) {
+    const auto & m = measurements[i];
+    ceres::CostFunction * cost = PlaneResidual::Create(
+      m.n_lidar, m.d_lidar, m.n0_body, m.d0_body,
+      cfg.wn, cfg.wd, cfg.wp, cfg.wD);
+    problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), rpy, t, dtheta_blocks[i].data(), &dD_blocks[i]);
+
+    const double dtheta_lim = deg2rad(cfg.bounds.dtheta_deg);
+    for (int j = 0; j < 3; ++j) {
+      problem.SetParameterLowerBound(dtheta_blocks[i].data(), j, -dtheta_lim);
+      problem.SetParameterUpperBound(dtheta_blocks[i].data(), j,  dtheta_lim);
+    }
+    problem.SetParameterLowerBound(&dD_blocks[i], 0, -cfg.bounds.dD_m);
+    problem.SetParameterUpperBound(&dD_blocks[i], 0,  cfg.bounds.dD_m);
+  }
+
+  for (int j = 0; j < 3; ++j) {
+    problem.SetParameterLowerBound(t, j, yin.t_init[j] - cfg.bounds.t_xyz_m[j]);
+    problem.SetParameterUpperBound(t, j, yin.t_init[j] + cfg.bounds.t_xyz_m[j]);
+    const double lim = deg2rad(cfg.bounds.rpy_deg[j]);
+    const double lower = yin.rpy_init_rad[j] - lim;
+    const double upper = yin.rpy_init_rad[j] + lim;
+    const double seeded = std::min(std::max(rpy[j], lower), upper);
+    rpy[j] = seeded;
+    problem.SetParameterLowerBound(rpy, j, lower);
+    problem.SetParameterUpperBound(rpy, j, upper);
+  }
+
+  ceres::Solver::Options options;
+  options.max_num_iterations = 100;
+  options.linear_solver_type = ceres::DENSE_QR;
+  options.minimizer_progress_to_stdout = false;
+  options.num_threads = 4;
+  options.function_tolerance = 1e-10;
+  options.gradient_tolerance = 1e-10;
+  options.parameter_tolerance = 1e-10;
+
+  ceres::Solver::Summary summary;
+  ceres::Solve(options, &problem, &summary);
+
+  SolverResult out;
+  out.success = summary.IsSolutionUsable();
+  out.summary = summary.BriefReport();
+  out.initial_cost = summary.initial_cost;
+  out.final_cost = summary.final_cost;
+  out.rpy_rad = Vector3d(rpy[0], rpy[1], rpy[2]);
+  out.t_m = Vector3d(t[0], t[1], t[2]);
+  out.R = rpyToR(out.rpy_rad);
+  out.seed_index = seed_index;
+  out.per_plane = evaluatePerPlaneDiagnostics(measurements, out);
+  out.strict_accept = passesStrictAcceptance(out, measurements, yin, cfg);
+  return out;
+}
+
+SolverResult solveCeres(
+  const std::vector<PlaneMeasurement> & measurements,
+  const YamlInput & yin,
+  const Config & cfg)
+{
+  if (measurements.size() != 3) fail("solveCeres requires exactly 3 plane measurements");
+
+  const auto seeds = buildSeedOffsets(cfg);
+  SolverResult best;
+  bool has_best = false;
+
+  for (std::size_t i = 0; i < seeds.size(); ++i) {
+    const SolverResult cur = solveSingleSeed(measurements, yin, cfg, seeds[i], static_cast<int>(i));
+    std::ostringstream oss;
+    oss << "seed " << i
+        << " final_cost=" << cur.final_cost
+        << " strict_accept=" << (cur.strict_accept ? "true" : "false")
+        << " t=" << cur.t_m.transpose()
+        << " rpy_deg=" << rad2deg(cur.rpy_rad.x()) << ","
+        << rad2deg(cur.rpy_rad.y()) << ","
+        << rad2deg(cur.rpy_rad.z());
+    logMessage(cfg, LogLevel::kInfo, oss.str());
+
+    if (!has_best) {
+      best = cur;
+      has_best = true;
+      continue;
+    }
+
+    const auto better = [&](const SolverResult & a, const SolverResult & b) {
+      if (a.strict_accept != b.strict_accept) return a.strict_accept;
+      if (a.success != b.success) return a.success;
+      return a.final_cost < b.final_cost;
+    };
+    if (better(cur, best)) best = cur;
+  }
+
+  return best;
+}
+
+void printExitCodeGuide() {
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "exit code meaning\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  std::cout << "0: success and strict_accept=true\n";
+  std::cout << "1: runtime/config/input error\n";
+  std::cout << "2: solver returned usable result, but strict acceptance failed\n";
+  std::cout << "3: solver failed or result unusable\n";
+}
+
+void printResult(const std::vector<PlaneMeasurement> & measurements, const SolverResult & result, const YamlInput & yin) {
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "Ceres result\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  std::cout << "success: " << (result.success ? "true" : "false") << "\n";
+  std::cout << "strict_accept: " << (result.strict_accept ? "true" : "false") << "\n";
+  std::cout << "seed_index: " << result.seed_index << "\n";
+  std::cout << "summary: " << result.summary << "\n";
+  std::cout << std::fixed << std::setprecision(10);
+  std::cout << "initial_cost: " << result.initial_cost << "\n";
+  std::cout << "final_cost  : " << result.final_cost << "\n";
+
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "optimized extrinsic: lidar -> body\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  std::cout << std::setprecision(6);
+  std::cout << "position in body (m): x=" << result.t_m.x()
+            << ", y=" << result.t_m.y()
+            << ", z=" << result.t_m.z() << "\n";
+  std::cout << "attitude in body (deg): roll=" << rad2deg(result.rpy_rad.x())
+            << ", pitch=" << rad2deg(result.rpy_rad.y())
+            << ", yaw=" << rad2deg(result.rpy_rad.z()) << "\n";
+  std::cout << std::setprecision(10);
+  std::cout << "attitude in body (rad): roll=" << result.rpy_rad.x()
+            << ", pitch=" << result.rpy_rad.y()
+            << ", yaw=" << result.rpy_rad.z() << "\n";
+  std::cout << std::setprecision(6);
+  std::cout << "delta t from init (m): " << (result.t_m - yin.t_init).transpose() << "\n";
+  std::cout << "delta rpy from init (deg): "
+            << rad2deg(result.rpy_rad.x() - yin.rpy_init_rad.x()) << ", "
+            << rad2deg(result.rpy_rad.y() - yin.rpy_init_rad.y()) << ", "
+            << rad2deg(result.rpy_rad.z() - yin.rpy_init_rad.z()) << "\n";
+
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "optimized rotation matrix R (lidar -> body)\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  std::cout << std::setprecision(10) << result.R << "\n";
+
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "measured planes in lidar frame used by Ceres\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  std::cout << std::setprecision(6);
+  for (const auto & m : measurements) {
+    std::cout << "plane " << m.plane_index << ": "
+              << planeEquationStr(m.n_lidar, m.d_lidar)
+              << " | roi_points=" << m.roi_point_count
+              << " | inliers=" << m.inlier_count
+              << " | init_angle_err_deg=" << m.init_normal_angle_err_deg
+              << " | init_dist_err_m=" << m.init_plane_distance_err_m
+              << "\n";
+  }
+
+  std::cout << "\n------------------------------------------------------------------------\n";
+  std::cout << "fitted planes transformed to body frame after optimization\n";
+  std::cout << "------------------------------------------------------------------------\n";
+  for (const auto & d : result.per_plane) {
+    std::cout << "fitted plane " << d.plane_index << ": "
+              << planeEquationStr(d.n_body_hat, d.d_body_hat)
+              << " | final_angle_err_deg=" << d.normal_angle_err_deg
+              << " | final_dist_err_m=" << d.plane_distance_err_m
+              << "\n";
+  }
+
+  printExitCodeGuide();
+}
+
+LogLevel parseLogLevel(const std::string & s) {
+  if (s == "info") return LogLevel::kInfo;
+  if (s == "warn") return LogLevel::kWarn;
+  if (s == "error") return LogLevel::kError;
+  fail("--log-level must be info|warn|error");
+}
+
+Config parseArgs(int argc, char ** argv) {
+  Config cfg;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    auto need = [&](const std::string & name) -> std::string {
+      if (i + 1 >= argc) fail("missing value for " + name);
+      return argv[++i];
+    };
+
+    if (arg == "--pcd-file") {
+      cfg.pcd_path = need(arg);
+    } else if (arg == "--yaml-path") {
+      cfg.yaml_path = need(arg);
+    } else if (arg == "--lidar-ip") {
+      cfg.lidar_ip = need(arg);
+    } else if (arg == "--angle-unit") {
+      cfg.angle_unit_cli = need(arg);
+    } else if (arg == "--ransac-distance-threshold") {
+      cfg.ransac_distance_threshold = std::stod(need(arg));
+    } else if (arg == "--ransac-iterations") {
+      cfg.ransac_iterations = std::stoi(need(arg));
+    } else if (arg == "--min-plane-points") {
+      cfg.min_plane_points = std::stoi(need(arg));
+    } else if (arg == "--wn") {
+      cfg.wn = std::stod(need(arg));
+    } else if (arg == "--wd") {
+      cfg.wd = std::stod(need(arg));
+    } else if (arg == "--wp") {
+      cfg.wp = std::stod(need(arg));
+    } else if (arg == "--wD") {
+      cfg.wD = std::stod(need(arg));
+    } else if (arg == "--log-level") {
+      cfg.log_level = parseLogLevel(need(arg));
+    } else if (arg == "--help" || arg == "-h") {
+      std::cout
+        << "Usage:\n"
+        << "  mid360_body_plane_calibrator_3planes_v3 \\\n"
+        << "    --pcd-file input.pcd \\\n"
+        << "    --yaml-path lidar_config.yaml \\\n"
+        << "    --lidar-ip 192.168.1.135 [--angle-unit deg|rad]\n\n"
+        << "Optional:\n"
+        << "  --ransac-distance-threshold 0.02\n"
+        << "  --ransac-iterations 1000\n"
+        << "  --min-plane-points 80\n"
+        << "  --wn 10 --wd 20 --wp 2 --wD 5\n"
+        << "  --log-level info|warn|error\n"
+        << "\nPlane convention:\n"
+        << "  This version uses only n^T x + d = 0 everywhere.\n"
+        << "\nExit codes:\n"
+        << "  0 strict accept\n"
+        << "  1 runtime/config/input error\n"
+        << "  2 usable result but strict acceptance failed\n"
+        << "  3 solve failed or unusable result\n";
+      std::exit(0);
+    } else {
+      fail("unknown argument: " + arg);
+    }
+  }
+
+  if (cfg.pcd_path.empty()) fail("--pcd-file is required");
+  if (cfg.yaml_path.empty()) fail("--yaml-path is required");
+  if (cfg.lidar_ip.empty()) fail("--lidar-ip is required");
+  if (!cfg.angle_unit_cli.empty() && cfg.angle_unit_cli != "deg" && cfg.angle_unit_cli != "rad") {
+    fail("--angle-unit must be deg or rad");
+  }
+  validateConfig(cfg);
+  return cfg;
+}
+
+
+
+RoiBox expandRoiBox(const RoiBox & roi, double pad) {
+  RoiBox out = roi;
+  out.xmin -= pad; out.xmax += pad;
+  out.ymin -= pad; out.ymax += pad;
+  out.zmin -= pad; out.zmax += pad;
+  return out;
+}
+
+std::vector<PlaneMeasurement> extractPlaneMeasurementsWithPadding(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud,
+  const YamlInput & yin,
+  const Config & cfg,
+  double roi_padding)
+{
+  YamlInput padded = yin;
+  for (std::size_t i = 0; i < 3; ++i) {
+    padded.rois_body[i] = expandRoiBox(yin.rois_body[i], roi_padding);
+  }
+  return extractPlaneMeasurements(raw_cloud, padded, cfg);
+}
+
+std::string loadTopicFromYaml(const std::string & yaml_path, const std::string & lidar_ip) {
+  const YAML::Node root = YAML::LoadFile(yaml_path);
+  if (!root[lidar_ip]) {
+    fail("lidar ip not found in yaml when reading topic: " + lidar_ip);
+  }
+  const YAML::Node node = root[lidar_ip];
+  if (node["topic"] && node["topic"].IsScalar()) {
+    return node["topic"].as<std::string>();
+  }
+  return "/livox/lidar";
+}
+
+void ensureParentDir(const std::string & file_path) {
+  if (file_path.empty()) return;
+  const auto parent = std::filesystem::path(file_path).parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent);
+  }
+}
+
+void ensureDir(const std::string & dir_path) {
+  if (dir_path.empty()) return;
+  std::filesystem::create_directories(dir_path);
+}
+
+void saveSolverResultYaml(
+  const std::string & output_result_path,
+  const std::string & lidar_ip,
+  const SolverResult & result,
+  const YamlInput & yin,
+  const std::vector<PlaneMeasurement> & measurements)
+{
+  if (output_result_path.empty()) {
+    return;
+  }
+
+  ensureParentDir(output_result_path);
+
+  YAML::Emitter out;
+  out << YAML::BeginMap;
+  out << YAML::Key << lidar_ip << YAML::Value;
+  out << YAML::BeginMap;
+  out << YAML::Key << "angle_unit" << YAML::Value << "deg";
+  out << YAML::Key << "x" << YAML::Value << result.t_m.x();
+  out << YAML::Key << "y" << YAML::Value << result.t_m.y();
+  out << YAML::Key << "z" << YAML::Value << result.t_m.z();
+  out << YAML::Key << "roll" << YAML::Value << rad2deg(result.rpy_rad.x());
+  out << YAML::Key << "pitch" << YAML::Value << rad2deg(result.rpy_rad.y());
+  out << YAML::Key << "yaw" << YAML::Value << rad2deg(result.rpy_rad.z());
+  out << YAML::Key << "success" << YAML::Value << result.success;
+  out << YAML::Key << "strict_accept" << YAML::Value << result.strict_accept;
+  out << YAML::Key << "initial_cost" << YAML::Value << result.initial_cost;
+  out << YAML::Key << "final_cost" << YAML::Value << result.final_cost;
+  out << YAML::Key << "seed_index" << YAML::Value << result.seed_index;
+
+  out << YAML::Key << "delta_t_m" << YAML::Value << YAML::Flow << YAML::BeginSeq
+      << (result.t_m.x() - yin.t_init.x())
+      << (result.t_m.y() - yin.t_init.y())
+      << (result.t_m.z() - yin.t_init.z())
+      << YAML::EndSeq;
+  out << YAML::Key << "delta_rpy_deg" << YAML::Value << YAML::Flow << YAML::BeginSeq
+      << rad2deg(result.rpy_rad.x() - yin.rpy_init_rad.x())
+      << rad2deg(result.rpy_rad.y() - yin.rpy_init_rad.y())
+      << rad2deg(result.rpy_rad.z() - yin.rpy_init_rad.z())
+      << YAML::EndSeq;
+
+  out << YAML::Key << "per_plane" << YAML::Value << YAML::BeginSeq;
+  for (std::size_t i = 0; i < result.per_plane.size(); ++i) {
+    const auto & d = result.per_plane[i];
+    const auto & m = measurements[i];
+    out << YAML::BeginMap;
+    out << YAML::Key << "plane_index" << YAML::Value << static_cast<int>(d.plane_index);
+    out << YAML::Key << "fitted_plane_body" << YAML::Value << YAML::Flow << YAML::BeginSeq
+        << d.n_body_hat.x() << d.n_body_hat.y() << d.n_body_hat.z() << d.d_body_hat << YAML::EndSeq;
+    out << YAML::Key << "final_normal_angle_error_deg" << YAML::Value << d.normal_angle_err_deg;
+    out << YAML::Key << "final_plane_distance_error_m" << YAML::Value << d.plane_distance_err_m;
+    out << YAML::Key << "init_normal_angle_error_deg" << YAML::Value << m.init_normal_angle_err_deg;
+    out << YAML::Key << "init_plane_distance_error_m" << YAML::Value << m.init_plane_distance_err_m;
+    out << YAML::Key << "roi_point_count" << YAML::Value << static_cast<int>(m.roi_point_count);
+    out << YAML::Key << "inlier_count" << YAML::Value << static_cast<int>(m.inlier_count);
+    out << YAML::EndMap;
+  }
+  out << YAML::EndSeq;
+
+  out << YAML::EndMap;
+  out << YAML::EndMap;
+
+  std::ofstream ofs(output_result_path);
+  if (!ofs) {
+    fail("failed to open output_result_path for write: " + output_result_path);
+  }
+  ofs << out.c_str();
+  ofs.close();
+}
 }  // namespace
 
-class MultiMid360Calibrator : public rclcpp::Node {
+
+class MultiMid360CalibratorNode : public rclcpp::Node {
 public:
-  MultiMid360Calibrator() : Node("multi_mid360_calibrator") {
-    declare_parameter<string>("config_path", "lidar_config.yaml");
-    declare_parameter<string>("target_lidar_ip", "");
-    declare_parameter<double>("accumulation_time_sec", 2.0);
-    declare_parameter<double>("roi_distance_threshold", 0.08);
-    declare_parameter<double>("ransac_distance_threshold", 0.02);
-    declare_parameter<int>("min_plane_points", 300);
-    declare_parameter<double>("voxel_leaf_size", 0.01);
-
-    // 第一轮：外参加边界，使用初始值 ± margin
-    declare_parameter<double>("tx_margin", 0.10);
-    declare_parameter<double>("ty_margin", 0.10);
-    declare_parameter<double>("tz_margin", 0.05);
-    declare_parameter<double>("roll_margin_deg", 10.0);
-    declare_parameter<double>("pitch_margin_deg", 5.0);
-    declare_parameter<double>("yaw_margin_deg", 5.0);
-
+  MultiMid360CalibratorNode()
+  : rclcpp::Node("multi_mid360_calibrator")
+  {
+    declare_parameter<std::string>("config_path", "");
+    declare_parameter<std::string>("target_lidar_ip", "");
+    declare_parameter<std::string>("input_topic", "");
+    declare_parameter<double>("accumulation_time_sec", 3.0);
+    declare_parameter<double>("roi_distance_threshold", 0.02);
+    declare_parameter<double>("ransac_distance_threshold", 0.01);
+    declare_parameter<std::string>("output_result_path", "");
+    declare_parameter<std::string>("output_cloud_dir", "");
+    declare_parameter<int>("min_plane_points", 80);
+    declare_parameter<int>("ransac_iterations", 1000);
     declare_parameter<double>("wn", 10.0);
     declare_parameter<double>("wd", 20.0);
     declare_parameter<double>("wp", 2.0);
     declare_parameter<double>("wD", 5.0);
+    declare_parameter<int>("multi_seed_mode", 1);
+    declare_parameter<std::string>("log_level", "info");
+    declare_parameter<std::string>("angle_unit", "");
 
-    // 第一轮：严格成功判定阈值
-    declare_parameter<double>("strict_max_final_cost", 0.30);
-    declare_parameter<double>("strict_max_normal_angle_error_deg", 8.0);
-    declare_parameter<double>("strict_max_distance_error_m", 0.03);
-    declare_parameter<double>("strict_max_mean_reprojection_error_m", 0.03);
-    declare_parameter<double>("strict_max_dtheta_deg", 5.0);
-    declare_parameter<double>("strict_max_dD_m", 0.03);
+    get_parameter("config_path", config_path_);
+    get_parameter("target_lidar_ip", target_lidar_ip_);
+    get_parameter("input_topic", input_topic_);
+    get_parameter("accumulation_time_sec", accumulation_time_sec_);
+    get_parameter("roi_distance_threshold", roi_distance_threshold_);
+    get_parameter("ransac_distance_threshold", ransac_distance_threshold_);
+    get_parameter("output_result_path", output_result_path_);
+    get_parameter("output_cloud_dir", output_cloud_dir_);
 
-    // 第二轮：平面偏差变量边界
-    declare_parameter<double>("plane_angle_dev_bound_deg", 5.0);
-    declare_parameter<double>("plane_offset_dev_bound_m", 0.03);
+    cfg_.yaml_path = config_path_;
+    cfg_.lidar_ip = target_lidar_ip_;
+    cfg_.ransac_distance_threshold = ransac_distance_threshold_;
+    cfg_.min_plane_points = get_parameter("min_plane_points").as_int();
+    cfg_.ransac_iterations = get_parameter("ransac_iterations").as_int();
+    cfg_.wn = get_parameter("wn").as_double();
+    cfg_.wd = get_parameter("wd").as_double();
+    cfg_.wp = get_parameter("wp").as_double();
+    cfg_.wD = get_parameter("wD").as_double();
+    cfg_.multi_seed_mode = get_parameter("multi_seed_mode").as_int();
+    cfg_.log_level = parseLogLevel(get_parameter("log_level").as_string());
+    cfg_.angle_unit_cli = get_parameter("angle_unit").as_string();
 
-    // 第一轮：多初值求解
-    declare_parameter<bool>("enable_multi_seed", true);
-    declare_parameter<double>("seed_pos_delta_xy", 0.03);
-    declare_parameter<double>("seed_pos_delta_z", 0.02);
-    declare_parameter<double>("seed_roll_delta_deg", 3.0);
-    declare_parameter<double>("seed_pitch_delta_deg", 2.0);
-    declare_parameter<double>("seed_yaw_delta_deg", 2.0);
-
-    // 第三轮：动态 8 字接口（骨架）
-    declare_parameter<bool>("enable_dynamic_figure8_refine", false);
-    declare_parameter<string>("figure8_data_path", "");
-
-    declare_parameter<bool>("publish_tf", true);
-    declare_parameter<string>("output_result_path", "/tmp/lidar_body_calib_result.yaml");
-
-    declare_parameter<bool>("save_raw_cloud", true);
-    declare_parameter<bool>("save_body_cloud", true);
-    declare_parameter<bool>("save_visualization_cloud", true);
-    declare_parameter<string>("output_cloud_dir", "/tmp/mid360_calib_outputs");
-    declare_parameter<double>("plane_vis_size", 0.8);
-    declare_parameter<double>("plane_vis_resolution", 0.05);
-    declare_parameter<double>("axis_vis_length", 0.4);
-    declare_parameter<double>("axis_vis_step", 0.01);
-
-    config_path_ = get_parameter("config_path").as_string();
-    target_lidar_ip_ = get_parameter("target_lidar_ip").as_string();
-    accumulation_time_sec_ = get_parameter("accumulation_time_sec").as_double();
-    roi_distance_threshold_ = get_parameter("roi_distance_threshold").as_double();
-    ransac_distance_threshold_ = get_parameter("ransac_distance_threshold").as_double();
-    min_plane_points_ = get_parameter("min_plane_points").as_int();
-    voxel_leaf_size_ = get_parameter("voxel_leaf_size").as_double();
-
-    tx_margin_ = get_parameter("tx_margin").as_double();
-    ty_margin_ = get_parameter("ty_margin").as_double();
-    tz_margin_ = get_parameter("tz_margin").as_double();
-    roll_margin_ = deg2rad(get_parameter("roll_margin_deg").as_double());
-    pitch_margin_ = deg2rad(get_parameter("pitch_margin_deg").as_double());
-    yaw_margin_ = deg2rad(get_parameter("yaw_margin_deg").as_double());
-
-    wn_ = get_parameter("wn").as_double();
-    wd_ = get_parameter("wd").as_double();
-    wp_ = get_parameter("wp").as_double();
-    wD_ = get_parameter("wD").as_double();
-
-    strict_max_final_cost_ = get_parameter("strict_max_final_cost").as_double();
-    strict_max_normal_angle_error_deg_ = get_parameter("strict_max_normal_angle_error_deg").as_double();
-    strict_max_distance_error_m_ = get_parameter("strict_max_distance_error_m").as_double();
-    strict_max_mean_reprojection_error_m_ = get_parameter("strict_max_mean_reprojection_error_m").as_double();
-    strict_max_dtheta_deg_ = get_parameter("strict_max_dtheta_deg").as_double();
-    strict_max_dD_m_ = get_parameter("strict_max_dD_m").as_double();
-
-    plane_angle_dev_bound_ = deg2rad(get_parameter("plane_angle_dev_bound_deg").as_double());
-    plane_offset_dev_bound_ = get_parameter("plane_offset_dev_bound_m").as_double();
-
-    enable_multi_seed_ = get_parameter("enable_multi_seed").as_bool();
-    seed_pos_delta_xy_ = get_parameter("seed_pos_delta_xy").as_double();
-    seed_pos_delta_z_ = get_parameter("seed_pos_delta_z").as_double();
-    seed_roll_delta_ = deg2rad(get_parameter("seed_roll_delta_deg").as_double());
-    seed_pitch_delta_ = deg2rad(get_parameter("seed_pitch_delta_deg").as_double());
-    seed_yaw_delta_ = deg2rad(get_parameter("seed_yaw_delta_deg").as_double());
-
-    enable_dynamic_figure8_refine_ = get_parameter("enable_dynamic_figure8_refine").as_bool();
-    figure8_data_path_ = get_parameter("figure8_data_path").as_string();
-
-    publish_tf_ = get_parameter("publish_tf").as_bool();
-    output_result_path_ = get_parameter("output_result_path").as_string();
-    save_raw_cloud_ = get_parameter("save_raw_cloud").as_bool();
-    save_body_cloud_ = get_parameter("save_body_cloud").as_bool();
-    save_visualization_cloud_ = get_parameter("save_visualization_cloud").as_bool();
-    output_cloud_dir_ = get_parameter("output_cloud_dir").as_string();
-    plane_vis_size_ = get_parameter("plane_vis_size").as_double();
-    plane_vis_resolution_ = get_parameter("plane_vis_resolution").as_double();
-    axis_vis_length_ = get_parameter("axis_vis_length").as_double();
-    axis_vis_step_ = get_parameter("axis_vis_step").as_double();
-
-    if (!loadConfig(config_path_)) {
-      throw std::runtime_error("Failed to load config: " + config_path_);
+    if (config_path_.empty()) {
+      throw std::runtime_error("parameter config_path is empty");
+    }
+    if (target_lidar_ip_.empty()) {
+      throw std::runtime_error("parameter target_lidar_ip is empty");
+    }
+    if (accumulation_time_sec_ <= 0.0) {
+      throw std::runtime_error("accumulation_time_sec must be > 0");
     }
 
-    std::filesystem::create_directories(output_cloud_dir_);
+    if (input_topic_.empty()) {
+      input_topic_ = loadTopicFromYaml(config_path_, target_lidar_ip_);
+    }
 
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("calib_plane_markers", 1);
+    validateConfig(cfg_);
+    ensureDir(output_cloud_dir_);
+    raw_accum_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+    raw_accum_cloud_->reserve(300000);
 
-    createSubscribers();
+    RCLCPP_INFO(get_logger(), "config_path: %s", config_path_.c_str());
+    RCLCPP_INFO(get_logger(), "target_lidar_ip: %s", target_lidar_ip_.c_str());
+    RCLCPP_INFO(get_logger(), "input_topic: %s", input_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "accumulation_time_sec: %.3f", accumulation_time_sec_);
+    RCLCPP_INFO(get_logger(), "roi_distance_threshold: %.4f", roi_distance_threshold_);
+    RCLCPP_INFO(get_logger(), "ransac_distance_threshold: %.4f", ransac_distance_threshold_);
 
-    RCLCPP_INFO(get_logger(), "Node started. Loaded %zu lidar configs.", lidar_configs_.size());
+    sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      input_topic_,
+      rclcpp::SensorDataQoS(),
+      std::bind(&MultiMid360CalibratorNode::onCloud, this, std::placeholders::_1));
+  }
+
+  int exitCode() const { return exit_code_; }
+
+private:
+  void onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    if (finished_) {
+      return;
+    }
+
+    pcl::PointCloud<pcl::PointXYZ> cloud;
+    try {
+      pcl::fromROSMsg(*msg, cloud);
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(get_logger(), "failed to convert PointCloud2 to PCL: %s", e.what());
+      finished_ = true;
+      rclcpp::shutdown();
+      return;
+    }
+
+    if (!started_) {
+      start_time_ = msg->header.stamp;
+      started_ = true;
+      RCLCPP_INFO(get_logger(), "first cloud received, start accumulation");
+    }
+
+    std::size_t appended = 0;
+    for (const auto & pt : cloud.points) {
+      if (!pcl::isFinite(pt)) continue;
+      const Vector3d p(pt.x, pt.y, pt.z);
+      if (!isReasonablePoint(p)) continue;
+      raw_accum_cloud_->points.push_back(pt);
+      ++appended;
+    }
+    raw_accum_cloud_->width = static_cast<std::uint32_t>(raw_accum_cloud_->points.size());
+    raw_accum_cloud_->height = 1;
+    raw_accum_cloud_->is_dense = false;
+
+    const double elapsed = elapsedSec(msg->header.stamp, start_time_);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+      "accumulating... latest_appended=%zu total_points=%zu elapsed=%.3f / %.3f sec",
+      appended, raw_accum_cloud_->points.size(), elapsed, accumulation_time_sec_);
+
+    if (elapsed >= accumulation_time_sec_) {
+      finished_ = true;
+      finalizeSolve();
+      rclcpp::shutdown();
+    }
+  }
+
+  double elapsedSec(const builtin_interfaces::msg::Time & now,
+                    const builtin_interfaces::msg::Time & then) const {
+    const double s_now = static_cast<double>(now.sec) + 1e-9 * static_cast<double>(now.nanosec);
+    const double s_then = static_cast<double>(then.sec) + 1e-9 * static_cast<double>(then.nanosec);
+    return s_now - s_then;
+  }
+
+  void finalizeSolve() {
+    try {
+      if (!raw_accum_cloud_ || raw_accum_cloud_->empty()) {
+        throw std::runtime_error("no accumulated point cloud available for calibration");
+      }
+
+      if (!output_cloud_dir_.empty()) {
+        const std::string raw_pcd = (std::filesystem::path(output_cloud_dir_) /
+          (std::string("lidar_") + sanitizeIp(target_lidar_ip_) + "_accumulated_raw.pcd")).string();
+        pcl::io::savePCDFileBinary(raw_pcd, *raw_accum_cloud_);
+        RCLCPP_INFO(get_logger(), "saved accumulated raw cloud to: %s", raw_pcd.c_str());
+      }
+
+      YamlInput yin = loadYamlInput(cfg_.yaml_path, cfg_.lidar_ip, cfg_);
+      auto measurements = extractPlaneMeasurementsWithPadding(raw_accum_cloud_, yin, cfg_, roi_distance_threshold_);
+      auto result = solveCeres(measurements, yin, cfg_);
+      printResult(measurements, result, yin);
+      saveSolverResultYaml(output_result_path_, target_lidar_ip_, result, yin, measurements);
+
+      if (!output_result_path_.empty()) {
+        RCLCPP_INFO(get_logger(), "saved calibration yaml to: %s", output_result_path_.c_str());
+      }
+
+      if (!result.success) {
+        exit_code_ = static_cast<int>(ExitCode::kSolveFailed);
+        RCLCPP_ERROR(get_logger(), "solver finished but result is unusable");
+      } else if (!result.strict_accept) {
+        exit_code_ = static_cast<int>(ExitCode::kUsableButNotStrict);
+        RCLCPP_WARN(get_logger(), "solver returned usable result, but strict acceptance failed");
+      } else {
+        exit_code_ = static_cast<int>(ExitCode::kStrictAccept);
+        RCLCPP_INFO(get_logger(), "solver succeeded and strict acceptance passed");
+      }
+    } catch (const std::exception & e) {
+      exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
+      RCLCPP_ERROR(get_logger(), "calibration failed: %s", e.what());
+    }
+  }
+
+  std::string sanitizeIp(const std::string & ip) const {
+    std::string out = ip;
+    std::replace(out.begin(), out.end(), '.', '_');
+    std::replace(out.begin(), out.end(), ':', '_');
+    return out;
   }
 
 private:
-  bool loadConfig(const string & path) {
-    YAML::Node root = YAML::LoadFile(path);
-    if (!root || root.IsNull()) {
-      RCLCPP_ERROR(get_logger(), "Config file empty: %s", path.c_str());
-      return false;
-    }
-
-    for (auto it = root.begin(); it != root.end(); ++it) {
-      LidarConfig cfg;
-      cfg.ip = it->first.as<string>();
-      const YAML::Node node = it->second;
-
-      if (!node["x"] || !node["y"] || !node["z"] ||
-          !node["roll"] || !node["pitch"] || !node["yaw"] || !node["planes"]) {
-        RCLCPP_ERROR(get_logger(), "Lidar %s config incomplete.", cfg.ip.c_str());
-        return false;
-      }
-
-      cfg.topic = node["topic"] ? node["topic"].as<string>() : ("/" + sanitizeIpToFrame(cfg.ip) + "/points");
-      cfg.x = node["x"].as<double>();
-      cfg.y = node["y"].as<double>();
-      cfg.z = node["z"].as<double>();
-      cfg.roll = deg2rad(node["roll"].as<double>());
-      cfg.pitch = deg2rad(node["pitch"].as<double>());
-      cfg.yaw = deg2rad(node["yaw"].as<double>());
-
-      for (const auto & plane_node : node["planes"]) {
-        auto coeff = plane_node.as<vector<double>>();
-        if (coeff.size() != 4) {
-          RCLCPP_ERROR(get_logger(), "Plane coeff size must be 4 for lidar %s", cfg.ip.c_str());
-          return false;
-        }
-        Vector4d p;
-        p << coeff[0], coeff[1], coeff[2], coeff[3];
-        cfg.planes.push_back(p);
-      }
-
-      cfg.plane_rois.resize(cfg.planes.size(), std::nullopt);
-      if (node["plane_rois"]) {
-        const YAML::Node rois = node["plane_rois"];
-        if (!rois.IsSequence()) {
-          RCLCPP_ERROR(get_logger(), "plane_rois must be a sequence for lidar %s", cfg.ip.c_str());
-          return false;
-        }
-        const std::size_t n = std::min<std::size_t>(rois.size(), cfg.planes.size());
-        for (std::size_t i = 0; i < n; ++i) {
-          if (rois[i].IsNull()) {
-            continue;
-          }
-          RoiBox box;
-          box.xmin = rois[i]["xmin"] ? rois[i]["xmin"].as<double>() : box.xmin;
-          box.xmax = rois[i]["xmax"] ? rois[i]["xmax"].as<double>() : box.xmax;
-          box.ymin = rois[i]["ymin"] ? rois[i]["ymin"].as<double>() : box.ymin;
-          box.ymax = rois[i]["ymax"] ? rois[i]["ymax"].as<double>() : box.ymax;
-          box.zmin = rois[i]["zmin"] ? rois[i]["zmin"].as<double>() : box.zmin;
-          box.zmax = rois[i]["zmax"] ? rois[i]["zmax"].as<double>() : box.zmax;
-          cfg.plane_rois[i] = box;
-        }
-      }
-
-      if (cfg.planes.size() < 3) {
-        RCLCPP_WARN(get_logger(), "Lidar %s has only %zu priors. Calibration is best with >=3 planes.",
-          cfg.ip.c_str(), cfg.planes.size());
-      }
-
-      lidar_configs_[cfg.ip] = cfg;
-      lidar_states_[cfg.ip] = LidarState{};
-      RCLCPP_INFO(get_logger(),
-        "Loaded lidar %s from topic %s with %zu planes. init_t=[%.3f, %.3f, %.3f], init_rpy_deg=[%.3f, %.3f, %.3f]",
-        cfg.ip.c_str(), cfg.topic.c_str(), cfg.planes.size(),
-        cfg.x, cfg.y, cfg.z,
-        rad2deg(cfg.roll), rad2deg(cfg.pitch), rad2deg(cfg.yaw));
-    }
-
-    if (!target_lidar_ip_.empty() && lidar_configs_.find(target_lidar_ip_) == lidar_configs_.end()) {
-      RCLCPP_ERROR(get_logger(), "target_lidar_ip %s not found in config.", target_lidar_ip_.c_str());
-      return false;
-    }
-
-    return true;
-  }
-
-  void createSubscribers() {
-    for (auto & kv : lidar_configs_) {
-      const string ip = kv.first;
-      if (!target_lidar_ip_.empty() && ip != target_lidar_ip_) {
-        continue;
-      }
-
-      const auto & cfg = kv.second;
-      auto callback = [this, ip](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-        this->pointCloudCallback(ip, msg);
-      };
-      lidar_states_[ip].sub = create_subscription<sensor_msgs::msg::PointCloud2>(
-        cfg.topic, rclcpp::SensorDataQoS(), callback);
-      RCLCPP_INFO(get_logger(), "Subscribed %s -> %s", ip.c_str(), cfg.topic.c_str());
-    }
-  }
-
-  void pointCloudCallback(const string & ip, const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    auto & state = lidar_states_.at(ip);
-    if (state.calibrated) {
-      return;
-    }
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr frame(new pcl::PointCloud<pcl::PointXYZ>());
-    try {
-      pcl::fromROSMsg(*msg, *frame);
-    } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "fromROSMsg failed for %s: %s", ip.c_str(), e.what());
-      return;
-    }
-
-    if (!state.started) {
-      state.accumulation_start = rclcpp::Time(msg->header.stamp);
-      state.started = true;
-      state.accumulated->clear();
-    }
-
-    *state.accumulated += *frame;
-    const rclcpp::Time current(msg->header.stamp);
-    const double elapsed = (current - state.accumulation_start).seconds();
-
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-      "Accumulating lidar %s: %.2fs / %.2fs, points=%zu",
-      ip.c_str(), elapsed, accumulation_time_sec_, state.accumulated->size());
-
-    if (elapsed < accumulation_time_sec_) {
-      return;
-    }
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr raw_cloud(new pcl::PointCloud<pcl::PointXYZ>(*state.accumulated));
-    finalizeCloud<pcl::PointXYZ>(raw_cloud);
-
-    if (save_raw_cloud_) {
-      saveRawCloud(ip, raw_cloud);
-    }
-
-    pcl::PointCloud<pcl::PointXYZ>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZ>());
-    voxelDownsample(raw_cloud, filtered, voxel_leaf_size_);
-    RCLCPP_INFO(get_logger(), "Lidar %s accumulated %.2fs, raw=%zu, voxel=%zu",
-      ip.c_str(), elapsed, raw_cloud->size(), filtered->size());
-
-    const auto result = calibrateSingleLidar(lidar_configs_.at(ip), filtered, raw_cloud, msg->header.frame_id);
-    if (result.has_value()) {
-      writeResultYaml(ip, *result);
-
-      if (publish_tf_) {
-        publishTransform(ip, *result, msg->header.frame_id);
-      }
-      publishMarkers(ip, *result, msg->header.frame_id);
-
-      if (save_body_cloud_ || save_visualization_cloud_) {
-        saveBodyAndVisualizationClouds(ip, *result, raw_cloud);
-      }
-
-      if (enable_dynamic_figure8_refine_) {
-        const auto dyn = runDynamicFigure8Refine(*result);
-        RCLCPP_WARN(get_logger(), "Dynamic figure-8 refine status: attempted=%s success=%s msg=%s",
-          dyn.attempted ? "true" : "false",
-          dyn.success ? "true" : "false",
-          dyn.message.c_str());
-      }
-
-      state.calibrated = true;
-      RCLCPP_INFO(get_logger(), "Calibration complete for %s", ip.c_str());
-    } else {
-      saveExtractionDebugOutputs(ip, lidar_configs_.at(ip), raw_cloud, filtered);
-      RCLCPP_WARN(get_logger(), "Calibration failed for %s. Restarting accumulation window.", ip.c_str());
-      state.started = false;
-      state.accumulated->clear();
-    }
-  }
-
-  vector<PlaneMeasurement> extractAndFitPlanes(
-    const LidarConfig & cfg,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud) const
-  {
-    vector<PlaneMeasurement> out;
-    const Matrix3d R0 = rpyToR(Vector3d(cfg.roll, cfg.pitch, cfg.yaw));
-    const Vector3d t0(cfg.x, cfg.y, cfg.z);
-
-    vector<std::optional<OrientedRoiBox>> roi_boxes_lidar(cfg.planes.size(), std::nullopt);
-    vector<AxisAlignedRoiBox> roi_aabbs_lidar;
-    for (std::size_t i = 0; i < cfg.planes.size(); ++i) {
-      const auto roi_box_body = (i < cfg.plane_rois.size()) ? cfg.plane_rois[i] : std::nullopt;
-      if (!roi_box_body.has_value()) {
-        continue;
-      }
-      roi_boxes_lidar[i] = transformRoiBoxBodyToLidar(*roi_box_body, R0, t0);
-      roi_aabbs_lidar.push_back(orientedRoiToAxisAlignedAabb(*roi_boxes_lidar[i]));
-    }
-
-    const auto union_lidar_aabb = unionAxisAlignedAabb(roi_aabbs_lidar);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr union_subset_lidar(new pcl::PointCloud<pcl::PointXYZ>());
-    vector<Vector3d> union_subset_body;
-    union_subset_body.reserve(cloud->size());
-
-    for (const auto & pt : cloud->points) {
-      if (!pcl::isFinite(pt)) {
-        continue;
-      }
-      const Vector3d p_lidar(pt.x, pt.y, pt.z);
-      if (!roi_aabbs_lidar.empty() && !union_lidar_aabb.contains(p_lidar)) {
-        continue;
-      }
-      union_subset_lidar->points.push_back(pt);
-      union_subset_body.push_back(R0 * p_lidar + t0);
-    }
-    finalizeCloud<pcl::PointXYZ>(union_subset_lidar);
-
-    RCLCPP_INFO(get_logger(),
-      "Lidar %s union ROI subset: source=%zu, inside_union_aabb=%zu, rois_with_bbox=%zu",
-      cfg.ip.c_str(), cloud->size(), union_subset_lidar->size(), roi_aabbs_lidar.size());
-
-    for (std::size_t i = 0; i < cfg.planes.size(); ++i) {
-      const auto & p = cfg.planes[i];
-      Vector3d N0 = Vector3d(p[0], p[1], p[2]);
-      const double norm = N0.norm();
-      if (norm < 1e-9) {
-        RCLCPP_WARN(get_logger(), "Plane %zu of %s has invalid normal.", i, cfg.ip.c_str());
-        continue;
-      }
-      N0 /= norm;
-      const Vector3d prior_input_normal = N0;
-      const double prior_input_d_body_std = p[3] / norm;
-      double d_body_std = prior_input_d_body_std;
-
-      const auto oriented_prior = orientPlaneTowardLidar(N0, d_body_std, t0);
-      const bool prior_flipped = (oriented_prior.first.dot(prior_input_normal) < 0.0);
-      N0 = oriented_prior.first;
-      d_body_std = oriented_prior.second;
-      const double D0 = -d_body_std;
-
-      const auto pred_lidar_plane = transformPlaneBodyToLidar(R0, t0, N0, d_body_std);
-      const auto roi_box_body = (i < cfg.plane_rois.size()) ? cfg.plane_rois[i] : std::nullopt;
-      std::size_t body_roi_hit_count = 0;
-      const auto roi_cloud = extractPlanePointsFromUnionSubset(
-        union_subset_lidar,
-        union_subset_body,
-        pred_lidar_plane.first,
-        pred_lidar_plane.second,
-        roi_distance_threshold_,
-        roi_box_body,
-        &body_roi_hit_count);
-      RCLCPP_INFO(get_logger(),
-        "Plane %zu for %s: union_aabb_points=%zu, body_roi_hits=%zu, plane_roi_points=%zu%s",
-        i, cfg.ip.c_str(), union_subset_lidar->size(), body_roi_hit_count, roi_cloud->size(),
-        roi_box_body.has_value() ? " with union-lidar-AABB + body-ROI" : " without body ROI");
-      if (static_cast<int>(roi_cloud->size()) < min_plane_points_) {
-        RCLCPP_WARN(get_logger(), "Plane %zu ROI too small for %s: %zu < %d", i, cfg.ip.c_str(),
-          roi_cloud->size(), min_plane_points_);
-        continue;
-      }
-
-      Vector3d n_fit;
-      double d_fit = 0.0;
-      std::size_t inlier_count = 0;
-      if (!fitPlaneRansac(roi_cloud, n_fit, d_fit, inlier_count)) {
-        continue;
-      }
-
-      n_fit = alignNormal(n_fit, pred_lidar_plane.first);
-      if (n_fit.dot(pred_lidar_plane.first) < 0.0) {
-        n_fit = -n_fit;
-        d_fit = -d_fit;
-      }
-
-      PlaneMeasurement m;
-      m.n_lidar = n_fit;
-      m.d_lidar = d_fit;
-      m.N0_body = N0;
-      m.D0_body = D0;
-      m.plane_index = i;
-      m.union_aabb_point_count = union_subset_lidar->size();
-      m.body_roi_hit_count = body_roi_hit_count;
-      m.inlier_count = inlier_count;
-      m.prior_flipped = prior_flipped;
-      m.prior_input_normal = prior_input_normal;
-      m.prior_input_d_body_std = prior_input_d_body_std;
-      m.prior_oriented_normal = N0;
-      m.prior_oriented_d_body_std = d_body_std;
-      m.roi_point_count = roi_cloud->size();
-      m.bbox_used = roi_box_body.has_value();
-      m.roi_box = roi_box_body;
-      m.roi_cloud = roi_cloud;
-      m.roi_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>(*roi_cloud));
-      out.push_back(m);
-
-      RCLCPP_INFO(get_logger(),
-        "Plane %zu used: nL=[%.5f %.5f %.5f], dL=%.5f, prior_flipped=%s, D0=%.5f, union_aabb_points=%zu, body_roi_hits=%zu, ransac_inliers=%zu",
-        i, n_fit.x(), n_fit.y(), n_fit.z(), d_fit, prior_flipped ? "true" : "false", D0,
-        m.union_aabb_point_count, m.body_roi_hit_count, m.inlier_count);
-    }
-    return out;
-  }
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr extractPlanePoints(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
-    const Vector3d & n_lidar,
-    double d_lidar,
-    double threshold,
-    const std::optional<OrientedRoiBox> & roi_box_lidar) const
-  {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>());
-    for (const auto & pt : cloud->points) {
-      if (!pcl::isFinite(pt)) {
-        continue;
-      }
-
-      const Vector3d p_lidar(pt.x, pt.y, pt.z);
-      if (roi_box_lidar.has_value() && !roi_box_lidar->contains(p_lidar)) {
-        continue;
-      }
-
-      const double dist = std::abs(n_lidar.dot(p_lidar) + d_lidar);
-      if (dist < threshold) {
-        out->points.push_back(pt);
-      }
-    }
-    finalizeCloud<pcl::PointXYZ>(out);
-    return out;
-  }
-
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr extractPlanePointsFromUnionSubset(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & union_subset_lidar,
-    const vector<Vector3d> & union_subset_body,
-    const Vector3d & n_lidar,
-    double d_lidar,
-    double threshold,
-    const std::optional<RoiBox> & roi_box_body,
-    std::size_t * body_roi_hit_count) const
-  {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>());
-    const std::size_t n = std::min<std::size_t>(union_subset_lidar->points.size(), union_subset_body.size());
-    out->points.reserve(n);
-    std::size_t body_hits = 0;
-    for (std::size_t idx = 0; idx < n; ++idx) {
-      const auto & pt = union_subset_lidar->points[idx];
-      if (!pcl::isFinite(pt)) {
-        continue;
-      }
-      const bool inside_body_roi = !roi_box_body.has_value() || roi_box_body->contains(union_subset_body[idx]);
-      if (!inside_body_roi) {
-        continue;
-      }
-      ++body_hits;
-      const Vector3d p_lidar(pt.x, pt.y, pt.z);
-      const double dist = std::abs(n_lidar.dot(p_lidar) + d_lidar);
-      if (dist < threshold) {
-        out->points.push_back(pt);
-      }
-    }
-    if (body_roi_hit_count) {
-      *body_roi_hit_count = body_hits;
-    }
-    finalizeCloud<pcl::PointXYZ>(out);
-    return out;
-  }
-
-  bool fitPlaneRansac(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
-    Vector3d & n,
-    double & d,
-    std::size_t & inlier_count) const
-  {
-    pcl::SACSegmentation<pcl::PointXYZ> seg;
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PLANE);
-    seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setDistanceThreshold(ransac_distance_threshold_);
-    seg.setMaxIterations(10000);
-    seg.setInputCloud(cloud);
-    seg.segment(*inliers, *coeff);
-
-    if (inliers->indices.empty() || coeff->values.size() < 4) {
-      RCLCPP_WARN(get_logger(), "RANSAC failed or no inliers.");
-      return false;
-    }
-
-    n = normalizeVec(Vector3d(coeff->values[0], coeff->values[1], coeff->values[2]));
-    d = coeff->values[3] / Vector3d(coeff->values[0], coeff->values[1], coeff->values[2]).norm();
-    inlier_count = inliers->indices.size();
-    return true;
-  }
-
-  void voxelDownsample(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & in,
-    pcl::PointCloud<pcl::PointXYZ>::Ptr & out,
-    double leaf) const
-  {
-    pcl::VoxelGrid<pcl::PointXYZ> voxel;
-    voxel.setInputCloud(in);
-    voxel.setLeafSize(static_cast<float>(leaf), static_cast<float>(leaf), static_cast<float>(leaf));
-    voxel.filter(*out);
-  }
-
-  void applyPoseBounds(
-    ceres::Problem & problem,
-    const LidarConfig & cfg,
-    double * rpy,
-    double * t) const
-  {
-    problem.SetParameterLowerBound(t, 0, cfg.x - tx_margin_);
-    problem.SetParameterUpperBound(t, 0, cfg.x + tx_margin_);
-    problem.SetParameterLowerBound(t, 1, cfg.y - ty_margin_);
-    problem.SetParameterUpperBound(t, 1, cfg.y + ty_margin_);
-    problem.SetParameterLowerBound(t, 2, cfg.z - tz_margin_);
-    problem.SetParameterUpperBound(t, 2, cfg.z + tz_margin_);
-
-    problem.SetParameterLowerBound(rpy, 0, cfg.roll - roll_margin_);
-    problem.SetParameterUpperBound(rpy, 0, cfg.roll + roll_margin_);
-    problem.SetParameterLowerBound(rpy, 1, cfg.pitch - pitch_margin_);
-    problem.SetParameterUpperBound(rpy, 1, cfg.pitch + pitch_margin_);
-    problem.SetParameterLowerBound(rpy, 2, cfg.yaw - yaw_margin_);
-    problem.SetParameterUpperBound(rpy, 2, cfg.yaw + yaw_margin_);
-  }
-
-  void applyPlaneDeviationBounds(
-    ceres::Problem & problem,
-    vector<std::array<double, 3>> & dtheta_blocks,
-    vector<double> & dD_blocks) const
-  {
-    for (std::size_t i = 0; i < dtheta_blocks.size(); ++i) {
-      for (int k = 0; k < 3; ++k) {
-        problem.SetParameterLowerBound(dtheta_blocks[i].data(), k, -plane_angle_dev_bound_);
-        problem.SetParameterUpperBound(dtheta_blocks[i].data(), k,  plane_angle_dev_bound_);
-      }
-      problem.SetParameterLowerBound(&dD_blocks[i], 0, -plane_offset_dev_bound_);
-      problem.SetParameterUpperBound(&dD_blocks[i], 0,  plane_offset_dev_bound_);
-    }
-  }
-
-  vector<std::pair<Vector3d, Vector3d>> buildSeedList(const LidarConfig & cfg) const {
-    vector<std::pair<Vector3d, Vector3d>> seeds;
-    const Vector3d rpy0(cfg.roll, cfg.pitch, cfg.yaw);
-    const Vector3d t0(cfg.x, cfg.y, cfg.z);
-    seeds.emplace_back(rpy0, t0);
-    if (!enable_multi_seed_) {
-      return seeds;
-    }
-
-    seeds.emplace_back(rpy0 + Vector3d( seed_roll_delta_, 0.0, 0.0), t0);
-    seeds.emplace_back(rpy0 + Vector3d(-seed_roll_delta_, 0.0, 0.0), t0);
-    seeds.emplace_back(rpy0 + Vector3d(0.0,  seed_pitch_delta_, 0.0), t0);
-    seeds.emplace_back(rpy0 + Vector3d(0.0, -seed_pitch_delta_, 0.0), t0);
-    seeds.emplace_back(rpy0 + Vector3d(0.0, 0.0,  seed_yaw_delta_), t0);
-    seeds.emplace_back(rpy0 + Vector3d(0.0, 0.0, -seed_yaw_delta_), t0);
-
-    seeds.emplace_back(rpy0, t0 + Vector3d( seed_pos_delta_xy_, 0.0, 0.0));
-    seeds.emplace_back(rpy0, t0 + Vector3d(-seed_pos_delta_xy_, 0.0, 0.0));
-    seeds.emplace_back(rpy0, t0 + Vector3d(0.0,  seed_pos_delta_xy_, 0.0));
-    seeds.emplace_back(rpy0, t0 + Vector3d(0.0, -seed_pos_delta_xy_, 0.0));
-    seeds.emplace_back(rpy0, t0 + Vector3d(0.0, 0.0,  seed_pos_delta_z_));
-    seeds.emplace_back(rpy0, t0 + Vector3d(0.0, 0.0, -seed_pos_delta_z_));
-
-    return seeds;
-  }
-
-  CandidateSolution solveOnce(
-    const LidarConfig & cfg,
-    const vector<PlaneMeasurement> & measurements,
-    const Vector3d & rpy_seed,
-    const Vector3d & t_seed,
-    int seed_index,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const
-  {
-    double rpy[3] = {rpy_seed.x(), rpy_seed.y(), rpy_seed.z()};
-    double t[3] = {t_seed.x(), t_seed.y(), t_seed.z()};
-    vector<std::array<double, 3>> dtheta_blocks(measurements.size(), {0.0, 0.0, 0.0});
-    vector<double> dD_blocks(measurements.size(), 0.0);
-
-    ceres::Problem problem;
-    for (std::size_t i = 0; i < measurements.size(); ++i) {
-      const auto & m = measurements[i];
-      ceres::CostFunction * cost = PlaneResidual::Create(
-        m.n_lidar, m.d_lidar, m.N0_body, m.D0_body,
-        wn_, wd_, wp_, wD_);
-      problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
-        rpy, t, dtheta_blocks[i].data(), &dD_blocks[i]);
-    }
-
-    applyPoseBounds(problem, cfg, rpy, t);
-    applyPlaneDeviationBounds(problem, dtheta_blocks, dD_blocks);
-
-    ceres::Solver::Options options;
-    options.max_num_iterations = 100;
-    options.linear_solver_type = ceres::DENSE_QR;
-    options.minimizer_progress_to_stdout = false;
-    options.num_threads = 4;
-    options.function_tolerance = 1e-10;
-    options.gradient_tolerance = 1e-10;
-    options.parameter_tolerance = 1e-10;
-
-    ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
-
-    CandidateSolution cand;
-    cand.seed_index = seed_index;
-    cand.rpy_opt = Vector3d(rpy[0], rpy[1], rpy[2]);
-    cand.t_opt = Vector3d(t[0], t[1], t[2]);
-    cand.R_opt = rpyToR(cand.rpy_opt);
-    cand.initial_cost = summary.initial_cost;
-    cand.final_cost = summary.final_cost;
-    cand.numeric_success = (
-      summary.termination_type == ceres::CONVERGENCE ||
-      summary.termination_type == ceres::USER_SUCCESS);
-    cand.summary = summary.BriefReport();
-    cand.used_measurements = measurements;
-    cand.union_aabb_point_count = measurements.empty() ? 0 : measurements.front().union_aabb_point_count;
-    cand.dtheta_opt = dtheta_blocks;
-    cand.dD_opt = dD_blocks;
-    cand.plane_diagnostics = evaluatePlaneDiagnostics(cand, raw_cloud);
-    return cand;
-  }
-
-  vector<PlaneDiagnostic> evaluatePlaneDiagnostics(
-    const CandidateSolution & cand,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const
-  {
-    vector<PlaneDiagnostic> out;
-    const auto body_cloud = transformCloudToBody(raw_cloud, cand);
-
-    for (std::size_t i = 0; i < cand.used_measurements.size(); ++i) {
-      const auto & m = cand.used_measurements[i];
-      const auto body_plane = transformPlaneToBody(cand.R_opt, cand.t_opt, m.n_lidar, m.d_lidar);
-      PlaneDiagnostic diag;
-      diag.plane_index = m.plane_index;
-      diag.dtheta_rad = Vector3d(cand.dtheta_opt[i][0], cand.dtheta_opt[i][1], cand.dtheta_opt[i][2]);
-      diag.dtheta_rad_norm = diag.dtheta_rad.norm();
-      diag.dtheta_deg_norm = rad2deg(diag.dtheta_rad_norm);
-      diag.dD_m = cand.dD_opt[i];
-      diag.normal_angle_error_deg = angleBetweenNormalsDeg(body_plane.first, m.N0_body);
-      diag.distance_error_m = std::abs(body_plane.second + m.D0_body);
-
-      // 第三轮：自动回投检查。把转换到车体系后的点云，对理想平面做统计误差
-      double sum_abs = 0.0;
-      double max_abs = 0.0;
-      std::size_t used = 0;
-      for (const auto & pt : body_cloud->points) {
-        if (!pcl::isFinite(pt)) {
-          continue;
-        }
-        const Vector3d p(pt.x, pt.y, pt.z);
-        const double dist = std::abs(m.N0_body.dot(p) + (-m.D0_body));
-        if (dist < roi_distance_threshold_) {
-          sum_abs += dist;
-          max_abs = std::max(max_abs, dist);
-          ++used;
-        }
-      }
-      diag.mean_abs_body_plane_dist_m = (used > 0) ? (sum_abs / static_cast<double>(used)) : std::numeric_limits<double>::infinity();
-      diag.max_abs_body_plane_dist_m = (used > 0) ? max_abs : std::numeric_limits<double>::infinity();
-      out.push_back(diag);
-    }
-    return out;
-  }
-
-  bool validateCalibrationResult(const LidarConfig & cfg, CandidateSolution & cand) const {
-    if (!cand.numeric_success) {
-      cand.strict_failure_reason = "numeric_not_converged";
-      cand.strict_success = false;
-      return false;
-    }
-    if (cand.final_cost > strict_max_final_cost_) {
-      cand.strict_failure_reason = "final_cost_too_high";
-      cand.strict_success = false;
-      return false;
-    }
-
-    if (cand.t_opt.x() < cfg.x - tx_margin_ || cand.t_opt.x() > cfg.x + tx_margin_ ||
-        cand.t_opt.y() < cfg.y - ty_margin_ || cand.t_opt.y() > cfg.y + ty_margin_ ||
-        cand.t_opt.z() < cfg.z - tz_margin_ || cand.t_opt.z() > cfg.z + tz_margin_) {
-      cand.strict_failure_reason = "translation_out_of_bounds";
-      cand.strict_success = false;
-      return false;
-    }
-
-    if (cand.rpy_opt.x() < cfg.roll - roll_margin_ || cand.rpy_opt.x() > cfg.roll + roll_margin_ ||
-        cand.rpy_opt.y() < cfg.pitch - pitch_margin_ || cand.rpy_opt.y() > cfg.pitch + pitch_margin_ ||
-        cand.rpy_opt.z() < cfg.yaw - yaw_margin_ || cand.rpy_opt.z() > cfg.yaw + yaw_margin_) {
-      cand.strict_failure_reason = "rotation_out_of_bounds";
-      cand.strict_success = false;
-      return false;
-    }
-
-    for (const auto & diag : cand.plane_diagnostics) {
-      if (diag.normal_angle_error_deg > strict_max_normal_angle_error_deg_) {
-        cand.strict_failure_reason = "plane_normal_error_too_large";
-        cand.strict_success = false;
-        return false;
-      }
-      if (diag.distance_error_m > strict_max_distance_error_m_) {
-        cand.strict_failure_reason = "plane_distance_error_too_large";
-        cand.strict_success = false;
-        return false;
-      }
-      if (diag.mean_abs_body_plane_dist_m > strict_max_mean_reprojection_error_m_) {
-        cand.strict_failure_reason = "reprojection_error_too_large";
-        cand.strict_success = false;
-        return false;
-      }
-      if (diag.dtheta_deg_norm > strict_max_dtheta_deg_) {
-        cand.strict_failure_reason = "plane_angle_deviation_too_large";
-        cand.strict_success = false;
-        return false;
-      }
-      if (std::abs(diag.dD_m) > strict_max_dD_m_) {
-        cand.strict_failure_reason = "plane_offset_deviation_too_large";
-        cand.strict_success = false;
-        return false;
-      }
-    }
-
-    cand.strict_success = true;
-    cand.strict_failure_reason.clear();
-    return true;
-  }
-
-  std::optional<CandidateSolution> pickBestCandidate(const vector<CandidateSolution> & candidates) const {
-    if (candidates.empty()) {
-      return std::nullopt;
-    }
-    const CandidateSolution * best = nullptr;
-    for (const auto & c : candidates) {
-      if (!c.strict_success) {
-        continue;
-      }
-      if (!best || c.final_cost < best->final_cost) {
-        best = &c;
-      }
-    }
-    if (best) {
-      return *best;
-    }
-
-    // 都未通过严格验收时，不返回“看起来能用”的坏解
-    return std::nullopt;
-  }
-
-  std::optional<CandidateSolution> calibrateSingleLidar(
-    const LidarConfig & cfg,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud,
-    const string & input_frame)
-  {
-    (void)input_frame;
-    const auto measurements = extractAndFitPlanes(cfg, cloud);
-    if (measurements.size() < 3) {
-      RCLCPP_ERROR(get_logger(), "Need at least 3 valid planes, got %zu for %s",
-        measurements.size(), cfg.ip.c_str());
-      return std::nullopt;
-    }
-
-    const auto seeds = buildSeedList(cfg);
-    vector<CandidateSolution> candidates;
-    candidates.reserve(seeds.size());
-
-    for (std::size_t i = 0; i < seeds.size(); ++i) {
-      auto cand = solveOnce(cfg, measurements, seeds[i].first, seeds[i].second, static_cast<int>(i), raw_cloud);
-      validateCalibrationResult(cfg, cand);
-      RCLCPP_INFO(get_logger(),
-        "Seed %zu result for %s: strict_success=%s, reason=%s, final_cost=%.6f, rpy_deg=[%.3f %.3f %.3f], t=[%.3f %.3f %.3f]",
-        i, cfg.ip.c_str(),
-        cand.strict_success ? "true" : "false",
-        cand.strict_failure_reason.empty() ? "ok" : cand.strict_failure_reason.c_str(),
-        cand.final_cost,
-        rad2deg(cand.rpy_opt.x()), rad2deg(cand.rpy_opt.y()), rad2deg(cand.rpy_opt.z()),
-        cand.t_opt.x(), cand.t_opt.y(), cand.t_opt.z());
-      candidates.push_back(std::move(cand));
-    }
-
-    const auto best = pickBestCandidate(candidates);
-    if (!best.has_value()) {
-      RCLCPP_ERROR(get_logger(), "No candidate passed strict validation for %s", cfg.ip.c_str());
-      return std::nullopt;
-    }
-
-    RCLCPP_INFO(get_logger(), "=== Best calibration result for %s (seed=%d) ===", cfg.ip.c_str(), best->seed_index);
-    RCLCPP_INFO(get_logger(), "Summary: %s", best->summary.c_str());
-    RCLCPP_INFO(get_logger(), "Cost: %.8f -> %.8f", best->initial_cost, best->final_cost);
-    RCLCPP_INFO(get_logger(), "RPY(deg): [%.6f, %.6f, %.6f]",
-      rad2deg(best->rpy_opt.x()), rad2deg(best->rpy_opt.y()), rad2deg(best->rpy_opt.z()));
-    RCLCPP_INFO(get_logger(), "t(m): [%.6f, %.6f, %.6f]",
-      best->t_opt.x(), best->t_opt.y(), best->t_opt.z());
-
-    return best;
-  }
-
-  DynamicRefineResult runDynamicFigure8Refine(const CandidateSolution &) const {
-    DynamicRefineResult out;
-    out.attempted = enable_dynamic_figure8_refine_;
-    if (!enable_dynamic_figure8_refine_) {
-      out.success = false;
-      out.message = "disabled";
-      return out;
-    }
-    out.success = false;
-    if (figure8_data_path_.empty()) {
-      out.message = "enabled_but_no_figure8_data_path_provided";
-      return out;
-    }
-    out.message = "interface_only_not_implemented_yet";
-    return out;
-  }
-
-  string makeBaseOutputPrefix(const string & ip) const {
-    const std::filesystem::path dir(output_cloud_dir_);
-    std::filesystem::create_directories(dir);
-    return (dir / sanitizeIpToFrame(ip)).string();
-  }
-
-  void saveRawCloud(const string & ip, const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const {
-    const string path = makeBaseOutputPrefix(ip) + "_raw_lidar.pcd";
-    if (pcl::io::savePCDFileBinary(path, *raw_cloud) == 0) {
-      RCLCPP_INFO(get_logger(), "Saved raw lidar cloud: %s", path.c_str());
-    } else {
-      RCLCPP_ERROR(get_logger(), "Failed to save raw lidar cloud: %s", path.c_str());
-    }
-  }
-
-  pcl::PointCloud<pcl::PointXYZ>::Ptr transformCloudToBody(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud_lidar,
-    const CandidateSolution & result) const
-  {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>());
-    out->reserve(cloud_lidar->size());
-    for (const auto & pt : cloud_lidar->points) {
-      if (!pcl::isFinite(pt)) {
-        continue;
-      }
-      const Vector3d p_l(pt.x, pt.y, pt.z);
-      const Vector3d p_b = result.R_opt * p_l + result.t_opt;
-      pcl::PointXYZ q;
-      q.x = static_cast<float>(p_b.x());
-      q.y = static_cast<float>(p_b.y());
-      q.z = static_cast<float>(p_b.z());
-      out->points.push_back(q);
-    }
-    finalizeCloud<pcl::PointXYZ>(out);
-    return out;
-  }
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr colorizeCloud(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
-    uint8_t r, uint8_t g, uint8_t b) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>());
-    out->reserve(cloud->size());
-    for (const auto & pt : cloud->points) {
-      if (!pcl::isFinite(pt)) {
-        continue;
-      }
-      out->points.push_back(makePointRGB(pt.x, pt.y, pt.z, r, g, b));
-    }
-    finalizeCloud<pcl::PointXYZRGB>(out);
-    return out;
-  }
-
-  void appendPlanePatch(
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
-    const Vector3d & n, double d,
-    double plane_size, double resolution,
-    uint8_t r, uint8_t g, uint8_t b) const
-  {
-    Vector3d normal = normalizeVec(n);
-    Vector3d center = -d * normal;
-
-    Vector3d ref = (std::abs(normal.z()) < 0.9) ? Vector3d::UnitZ() : Vector3d::UnitX();
-    Vector3d u = normalizeVec(normal.cross(ref));
-    Vector3d v = normalizeVec(normal.cross(u));
-
-    const int steps = std::max(1, static_cast<int>(std::ceil(plane_size / resolution)));
-    const double half = plane_size * 0.5;
-    for (int i = -steps; i <= steps; ++i) {
-      for (int j = -steps; j <= steps; ++j) {
-        const double du = static_cast<double>(i) * resolution;
-        const double dv = static_cast<double>(j) * resolution;
-        if (std::abs(du) > half || std::abs(dv) > half) {
-          continue;
-        }
-        const Vector3d p = center + du * u + dv * v;
-        cloud->points.push_back(makePointRGB(p.x(), p.y(), p.z(), r, g, b));
-      }
-    }
-  }
-
-  void appendAxisLine(
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
-    const Vector3d & origin,
-    const Vector3d & direction,
-    double length,
-    double step,
-    uint8_t r, uint8_t g, uint8_t b) const
-  {
-    const Vector3d dir = normalizeVec(direction);
-    const int n = std::max(2, static_cast<int>(std::ceil(length / step)));
-    for (int i = 0; i <= n; ++i) {
-      const double s = std::min(length, i * step);
-      const Vector3d p = origin + s * dir;
-      cloud->points.push_back(makePointRGB(p.x(), p.y(), p.z(), r, g, b));
-    }
-  }
-
-  void appendFrameAxes(
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
-    const Vector3d & origin,
-    const Matrix3d & R,
-    double length,
-    double step) const
-  {
-    appendAxisLine(cloud, origin, R.col(0), length, step, 255, 0, 0);
-    appendAxisLine(cloud, origin, R.col(1), length, step, 0, 255, 0);
-    appendAxisLine(cloud, origin, R.col(2), length, step, 0, 0, 255);
-  }
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildVisualizationCloud(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud_body,
-    const CandidateSolution & result) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr vis = colorizeCloud(cloud_body, 180, 180, 180);
-
-    const std::array<std::array<uint8_t, 3>, 6> colors = {{
-      {{255, 128, 0}},
-      {{255, 0, 255}},
-      {{0, 255, 255}},
-      {{255, 255, 0}},
-      {{0, 128, 255}},
-      {{128, 255, 0}}
-    }};
-
-    for (std::size_t i = 0; i < result.used_measurements.size(); ++i) {
-      const auto & m = result.used_measurements[i];
-      const auto plane_body = transformPlaneToBody(result.R_opt, result.t_opt, m.n_lidar, m.d_lidar);
-      const auto & c = colors[i % colors.size()];
-      appendPlanePatch(vis, plane_body.first, plane_body.second,
-        plane_vis_size_, plane_vis_resolution_, c[0], c[1], c[2]);
-    }
-
-    appendFrameAxes(vis, Vector3d::Zero(), Matrix3d::Identity(), axis_vis_length_, axis_vis_step_);
-    appendFrameAxes(vis, result.t_opt, result.R_opt, axis_vis_length_, axis_vis_step_);
-
-    finalizeCloud<pcl::PointXYZRGB>(vis);
-    return vis;
-  }
-
-  void saveBodyAndVisualizationClouds(
-    const string & ip,
-    const CandidateSolution & result,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud) const
-  {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr body_cloud = transformCloudToBody(raw_cloud, result);
-    const string base = makeBaseOutputPrefix(ip);
-
-    if (save_body_cloud_) {
-      const string body_path = base + "_raw_in_body.pcd";
-      if (pcl::io::savePCDFileBinary(body_path, *body_cloud) == 0) {
-        RCLCPP_INFO(get_logger(), "Saved body-frame raw cloud: %s", body_path.c_str());
-      } else {
-        RCLCPP_ERROR(get_logger(), "Failed to save body-frame raw cloud: %s", body_path.c_str());
-      }
-    }
-
-    if (save_visualization_cloud_) {
-      pcl::PointCloud<pcl::PointXYZRGB>::Ptr vis_cloud = buildVisualizationCloud(body_cloud, result);
-      const string vis_path = base + "_body_with_planes_axes.pcd";
-      if (pcl::io::savePCDFileBinary(vis_path, *vis_cloud) == 0) {
-        RCLCPP_INFO(get_logger(), "Saved visualization cloud: %s", vis_path.c_str());
-      } else {
-        RCLCPP_ERROR(get_logger(), "Failed to save visualization cloud: %s", vis_path.c_str());
-      }
-    }
-  }
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildPlanePatchCloud(
-    const CandidateSolution & result) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>());
-    const std::array<std::array<uint8_t, 3>, 6> colors = {{
-      {{255, 128, 0}},
-      {{255, 0, 255}},
-      {{0, 255, 255}},
-      {{255, 255, 0}},
-      {{0, 128, 255}},
-      {{128, 255, 0}}
-    }};
-
-    for (std::size_t i = 0; i < result.used_measurements.size(); ++i) {
-      const auto & m = result.used_measurements[i];
-      const auto plane_body = transformPlaneToBody(result.R_opt, result.t_opt, m.n_lidar, m.d_lidar);
-      const auto & c = colors[i % colors.size()];
-      appendPlanePatch(out, plane_body.first, plane_body.second,
-        plane_vis_size_, plane_vis_resolution_, c[0], c[1], c[2]);
-    }
-    finalizeCloud<pcl::PointXYZRGB>(out);
-    return out;
-  }
-
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildPlanePatchCloudFromMeasurementsLidar(
-    const vector<PlaneMeasurement> & measurements) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>());
-    const std::array<std::array<uint8_t, 3>, 6> colors = {{
-      {{255, 128, 0}},
-      {{255, 0, 255}},
-      {{0, 255, 255}},
-      {{255, 255, 0}},
-      {{0, 128, 255}},
-      {{128, 255, 0}}
-    }};
-
-    for (std::size_t i = 0; i < measurements.size(); ++i) {
-      const auto & m = measurements[i];
-      const auto & c = colors[i % colors.size()];
-      appendPlanePatch(out, m.n_lidar, m.d_lidar,
-        plane_vis_size_, plane_vis_resolution_, c[0], c[1], c[2]);
-    }
-    finalizeCloud<pcl::PointXYZRGB>(out);
-    return out;
-  }
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildRoiDebugCloud(
-    const vector<PlaneMeasurement> & measurements) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr out(new pcl::PointCloud<pcl::PointXYZRGB>());
-    const std::array<std::array<uint8_t, 3>, 6> colors = {{
-      {{255, 128, 0}},
-      {{255, 0, 255}},
-      {{0, 255, 255}},
-      {{255, 255, 0}},
-      {{0, 128, 255}},
-      {{128, 255, 0}}
-    }};
-
-    for (std::size_t i = 0; i < measurements.size(); ++i) {
-      if (!measurements[i].roi_cloud) {
-        continue;
-      }
-      const auto & c = colors[i % colors.size()];
-      for (const auto & pt : measurements[i].roi_cloud->points) {
-        if (!pcl::isFinite(pt)) {
-          continue;
-        }
-        out->points.push_back(makePointRGB(pt.x, pt.y, pt.z, c[0], c[1], c[2]));
-      }
-    }
-    finalizeCloud<pcl::PointXYZRGB>(out);
-    return out;
-  }
-
-
-  void appendRoiWireframeLidar(
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr & cloud,
-    const RoiBox & roi_body,
-    const Matrix3d & R_lidar_to_body,
-    const Vector3d & t_lidar_to_body,
-    uint8_t r, uint8_t g, uint8_t b) const
-  {
-    const auto corners_body = bodyRoiCorners(roi_body);
-    std::array<Vector3d, 8> corners_lidar;
-    for (std::size_t i = 0; i < corners_body.size(); ++i) {
-      corners_lidar[i] = R_lidar_to_body.transpose() * (corners_body[i] - t_lidar_to_body);
-    }
-
-    const std::array<std::array<int, 2>, 12> edges = {{
-      {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
-      {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
-      {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}}
-    }};
-
-    const double wire_step = std::max(0.5 * axis_vis_step_, 0.005);
-    for (const auto & edge : edges) {
-      const Vector3d & p0 = corners_lidar[edge[0]];
-      const Vector3d & p1 = corners_lidar[edge[1]];
-      const Vector3d dir = p1 - p0;
-      const double len = dir.norm();
-      if (len < 1e-9) {
-        cloud->points.push_back(makePointRGB(p0.x(), p0.y(), p0.z(), r, g, b));
-        continue;
-      }
-      const Vector3d unit = dir / len;
-      const int n = std::max(2, static_cast<int>(std::ceil(len / wire_step)));
-      for (int i = 0; i <= n; ++i) {
-        const double s = std::min(len, i * wire_step);
-        const Vector3d p = p0 + s * unit;
-        cloud->points.push_back(makePointRGB(p.x(), p.y(), p.z(), r, g, b));
-      }
-    }
-  }
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr buildExtractionDebugCloud(
-    const LidarConfig & cfg,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & filtered_cloud,
-    const vector<PlaneMeasurement> & measurements) const
-  {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr vis(new pcl::PointCloud<pcl::PointXYZRGB>());
-    vis->reserve(raw_cloud->size() + filtered_cloud->size());
-
-    for (const auto & pt : raw_cloud->points) {
-      if (!pcl::isFinite(pt)) continue;
-      vis->points.push_back(makePointRGB(pt.x, pt.y, pt.z, 100, 180, 255));
-    }
-    for (const auto & pt : filtered_cloud->points) {
-      if (!pcl::isFinite(pt)) continue;
-      vis->points.push_back(makePointRGB(pt.x, pt.y, pt.z, 160, 160, 160));
-    }
-
-    const std::array<std::array<uint8_t, 3>, 6> colors = {{
-      {{255, 64, 64}},
-      {{64, 255, 64}},
-      {{64, 128, 255}},
-      {{255, 180, 0}},
-      {{255, 64, 255}},
-      {{0, 220, 220}}
-    }};
-
-    const std::array<std::array<uint8_t, 3>, 3> roi_wire_colors = {{
-      {{255, 255, 0}},
-      {{255, 0, 255}},
-      {{0, 0, 0}}
-    }};
-    const Matrix3d R0 = rpyToR(Vector3d(cfg.roll, cfg.pitch, cfg.yaw));
-    const Vector3d t0(cfg.x, cfg.y, cfg.z);
-    for (std::size_t i = 0; i < std::min<std::size_t>(3, cfg.plane_rois.size()); ++i) {
-      if (!cfg.plane_rois[i].has_value()) {
-        continue;
-      }
-      const auto & c = roi_wire_colors[i % roi_wire_colors.size()];
-      appendRoiWireframeLidar(vis, *cfg.plane_rois[i], R0, t0, c[0], c[1], c[2]);
-    }
-
-    for (std::size_t i = 0; i < measurements.size(); ++i) {
-      const auto & m = measurements[i];
-      const auto & c = colors[i % colors.size()];
-
-      if (m.roi_cloud) {
-        for (const auto & pt : m.roi_cloud->points) {
-          if (!pcl::isFinite(pt)) continue;
-          vis->points.push_back(makePointRGB(pt.x, pt.y, pt.z, c[0], c[1], c[2]));
-        }
-      }
-
-      appendPlanePatch(vis, m.n_lidar, m.d_lidar,
-        plane_vis_size_, plane_vis_resolution_, c[0], c[1], c[2]);
-
-      Vector3d center = -m.d_lidar * normalizeVec(m.n_lidar);
-      appendAxisLine(vis, center, normalizeVec(m.n_lidar), axis_vis_length_ * 0.6,
-        axis_vis_step_, 255, 255, 255);
-    }
-
-    appendFrameAxes(vis, Vector3d::Zero(), Matrix3d::Identity(), axis_vis_length_, axis_vis_step_);
-    finalizeCloud<pcl::PointXYZRGB>(vis);
-    return vis;
-  }
-
-  void saveExtractionDebugOutputs(
-    const string & ip,
-    const LidarConfig & cfg,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & raw_cloud,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & filtered_cloud) const
-  {
-    const auto measurements = extractAndFitPlanes(cfg, filtered_cloud);
-    const string base = makeBaseOutputPrefix(ip);
-
-    const string voxel_path = base + "_voxel_lidar.pcd";
-    if (pcl::io::savePCDFileBinary(voxel_path, *filtered_cloud) == 0) {
-      RCLCPP_INFO(get_logger(), "Saved voxel lidar cloud: %s", voxel_path.c_str());
-    } else {
-      RCLCPP_ERROR(get_logger(), "Failed to save voxel lidar cloud: %s", voxel_path.c_str());
-    }
-
-    for (std::size_t i = 0; i < measurements.size(); ++i) {
-      if (!measurements[i].roi_cloud) {
-        continue;
-      }
-      const string roi_path = base + "_plane_" + std::to_string(i) + "_roi_lidar.pcd";
-      if (pcl::io::savePCDFileBinary(roi_path, *measurements[i].roi_cloud) == 0) {
-        RCLCPP_INFO(get_logger(), "Saved plane %zu ROI cloud: %s", i, roi_path.c_str());
-      } else {
-        RCLCPP_ERROR(get_logger(), "Failed to save plane %zu ROI cloud: %s", i, roi_path.c_str());
-      }
-    }
-
-    const auto debug_cloud = buildExtractionDebugCloud(cfg, raw_cloud, filtered_cloud, measurements);
-    const string debug_path = base + "_debug_planes_lidar.pcd";
-    if (pcl::io::savePCDFileBinary(debug_path, *debug_cloud) == 0) {
-      RCLCPP_INFO(get_logger(),
-        "Saved extraction debug cloud: %s (light blue=raw, grey=voxel, yellow/purple/black=YAML body ROI wireframes in lidar frame, red/green/blue=ROI+plane fit results)",
-        debug_path.c_str());
-    } else {
-      RCLCPP_ERROR(get_logger(), "Failed to save extraction debug cloud: %s", debug_path.c_str());
-    }
-  }
-
-
-  void writeResultYaml(const string & ip, const CandidateSolution & result) const {
-    YAML::Node root;
-    root["ip"] = ip;
-    root["numeric_success"] = result.numeric_success;
-    root["strict_success"] = result.strict_success;
-    root["strict_failure_reason"] = result.strict_failure_reason;
-    root["summary"] = result.summary;
-    root["initial_cost"] = result.initial_cost;
-    root["final_cost"] = result.final_cost;
-    root["selected_seed_index"] = result.seed_index;
-    root["union_aabb_point_count"] = static_cast<int>(result.union_aabb_point_count);
-
-    YAML::Node rpy;
-    rpy.push_back(result.rpy_opt.x());
-    rpy.push_back(result.rpy_opt.y());
-    rpy.push_back(result.rpy_opt.z());
-    root["rpy_rad"] = rpy;
-
-    YAML::Node rpy_deg;
-    rpy_deg.push_back(rad2deg(result.rpy_opt.x()));
-    rpy_deg.push_back(rad2deg(result.rpy_opt.y()));
-    rpy_deg.push_back(rad2deg(result.rpy_opt.z()));
-    root["rpy_deg"] = rpy_deg;
-
-    YAML::Node t;
-    t.push_back(result.t_opt.x());
-    t.push_back(result.t_opt.y());
-    t.push_back(result.t_opt.z());
-    root["t_m"] = t;
-
-    YAML::Node R;
-    for (int i = 0; i < 3; ++i) {
-      YAML::Node row;
-      for (int j = 0; j < 3; ++j) {
-        row.push_back(result.R_opt(i, j));
-      }
-      R.push_back(row);
-    }
-    root["R"] = R;
-
-    YAML::Node bounds;
-    bounds["tx_min"] = lidar_configs_.at(ip).x - tx_margin_;
-    bounds["tx_max"] = lidar_configs_.at(ip).x + tx_margin_;
-    bounds["ty_min"] = lidar_configs_.at(ip).y - ty_margin_;
-    bounds["ty_max"] = lidar_configs_.at(ip).y + ty_margin_;
-    bounds["tz_min"] = lidar_configs_.at(ip).z - tz_margin_;
-    bounds["tz_max"] = lidar_configs_.at(ip).z + tz_margin_;
-    bounds["roll_min_deg"] = rad2deg(lidar_configs_.at(ip).roll - roll_margin_);
-    bounds["roll_max_deg"] = rad2deg(lidar_configs_.at(ip).roll + roll_margin_);
-    bounds["pitch_min_deg"] = rad2deg(lidar_configs_.at(ip).pitch - pitch_margin_);
-    bounds["pitch_max_deg"] = rad2deg(lidar_configs_.at(ip).pitch + pitch_margin_);
-    bounds["yaw_min_deg"] = rad2deg(lidar_configs_.at(ip).yaw - yaw_margin_);
-    bounds["yaw_max_deg"] = rad2deg(lidar_configs_.at(ip).yaw + yaw_margin_);
-    root["pose_bounds"] = bounds;
-
-    YAML::Node validation;
-    validation["strict_max_final_cost"] = strict_max_final_cost_;
-    validation["strict_max_normal_angle_error_deg"] = strict_max_normal_angle_error_deg_;
-    validation["strict_max_distance_error_m"] = strict_max_distance_error_m_;
-    validation["strict_max_mean_reprojection_error_m"] = strict_max_mean_reprojection_error_m_;
-    validation["strict_max_dtheta_deg"] = strict_max_dtheta_deg_;
-    validation["strict_max_dD_m"] = strict_max_dD_m_;
-    root["validation_thresholds"] = validation;
-
-    YAML::Node plane_dev_bounds;
-    plane_dev_bounds["angle_bound_deg"] = rad2deg(plane_angle_dev_bound_);
-    plane_dev_bounds["offset_bound_m"] = plane_offset_dev_bound_;
-    root["plane_deviation_bounds"] = plane_dev_bounds;
-
-    YAML::Node planes;
-    for (std::size_t i = 0; i < result.used_measurements.size(); ++i) {
-      const auto & m = result.used_measurements[i];
-      YAML::Node item;
-      item["plane_index"] = static_cast<int>(m.plane_index);
-      item["union_aabb_point_count"] = static_cast<int>(m.union_aabb_point_count);
-      item["body_roi_hit_count"] = static_cast<int>(m.body_roi_hit_count);
-      item["inlier_count"] = static_cast<int>(m.inlier_count);
-      item["roi_point_count"] = static_cast<int>(m.roi_point_count);
-      item["prior_flipped"] = m.prior_flipped;
-      item["bbox_used"] = m.bbox_used;
-
-      YAML::Node prior_input_n;
-      prior_input_n.push_back(m.prior_input_normal.x());
-      prior_input_n.push_back(m.prior_input_normal.y());
-      prior_input_n.push_back(m.prior_input_normal.z());
-      item["prior_input_normal"] = prior_input_n;
-      item["prior_input_d_body_std"] = m.prior_input_d_body_std;
-
-      YAML::Node prior_oriented_n;
-      prior_oriented_n.push_back(m.prior_oriented_normal.x());
-      prior_oriented_n.push_back(m.prior_oriented_normal.y());
-      prior_oriented_n.push_back(m.prior_oriented_normal.z());
-      item["prior_oriented_normal"] = prior_oriented_n;
-      item["prior_oriented_d_body_std"] = m.prior_oriented_d_body_std;
-
-      if (m.roi_box.has_value()) {
-        YAML::Node roi;
-        roi["xmin"] = m.roi_box->xmin;
-        roi["xmax"] = m.roi_box->xmax;
-        roi["ymin"] = m.roi_box->ymin;
-        roi["ymax"] = m.roi_box->ymax;
-        roi["zmin"] = m.roi_box->zmin;
-        roi["zmax"] = m.roi_box->zmax;
-        item["roi_box_body"] = roi;
-      }
-
-      YAML::Node nL;
-      nL.push_back(m.n_lidar.x());
-      nL.push_back(m.n_lidar.y());
-      nL.push_back(m.n_lidar.z());
-      item["n_lidar"] = nL;
-      item["d_lidar"] = m.d_lidar;
-      YAML::Node N0;
-      N0.push_back(m.N0_body.x());
-      N0.push_back(m.N0_body.y());
-      N0.push_back(m.N0_body.z());
-      item["N0_body"] = N0;
-      item["D0_body"] = m.D0_body;
-
-      const auto plane_body = transformPlaneToBody(result.R_opt, result.t_opt, m.n_lidar, m.d_lidar);
-      YAML::Node nB;
-      nB.push_back(plane_body.first.x());
-      nB.push_back(plane_body.first.y());
-      nB.push_back(plane_body.first.z());
-      item["n_body_est"] = nB;
-      item["d_body_est"] = plane_body.second;
-
-      YAML::Node dtheta;
-      dtheta.push_back(result.dtheta_opt[i][0]);
-      dtheta.push_back(result.dtheta_opt[i][1]);
-      dtheta.push_back(result.dtheta_opt[i][2]);
-      item["dtheta_rad"] = dtheta;
-      item["dtheta_deg_norm"] = result.plane_diagnostics[i].dtheta_deg_norm;
-      item["dD_m"] = result.dD_opt[i];
-      item["normal_angle_error_deg"] = result.plane_diagnostics[i].normal_angle_error_deg;
-      item["distance_error_m"] = result.plane_diagnostics[i].distance_error_m;
-      item["mean_abs_body_plane_dist_m"] = result.plane_diagnostics[i].mean_abs_body_plane_dist_m;
-      item["max_abs_body_plane_dist_m"] = result.plane_diagnostics[i].max_abs_body_plane_dist_m;
-
-      planes.push_back(item);
-    }
-    root["used_planes"] = planes;
-
-    YAML::Node dynamic_node;
-    dynamic_node["enable_dynamic_figure8_refine"] = enable_dynamic_figure8_refine_;
-    dynamic_node["figure8_data_path"] = figure8_data_path_;
-    dynamic_node["status"] = enable_dynamic_figure8_refine_ ? "interface_only" : "disabled";
-    root["dynamic_figure8_refine"] = dynamic_node;
-
-    YAML::Node outputs;
-    const string base = makeBaseOutputPrefix(ip);
-    if (save_raw_cloud_) {
-      outputs["raw_lidar_pcd"] = base + "_raw_lidar.pcd";
-    }
-    if (save_body_cloud_) {
-      outputs["raw_body_pcd"] = base + "_raw_in_body.pcd";
-    }
-    if (save_visualization_cloud_) {
-      outputs["visualization_body_pcd"] = base + "_body_with_planes_axes.pcd";
-    }
-    outputs["voxel_lidar_pcd"] = base + "_voxel_lidar.pcd";
-    outputs["debug_lidar_pcd"] = base + "_debug_planes_lidar.pcd";
-    root["output_files"] = outputs;
-
-    string path = output_result_path_;
-    const auto pos = path.rfind(".yaml");
-    if (pos != string::npos) {
-      path.insert(pos, "_" + sanitizeIpToFrame(ip));
-    } else {
-      path += "_" + sanitizeIpToFrame(ip) + ".yaml";
-    }
-    std::ofstream ofs(path);
-    ofs << root;
-    ofs.close();
-    RCLCPP_INFO(get_logger(), "Wrote result YAML: %s", path.c_str());
-  }
-
-  void publishTransform(const string & ip, const CandidateSolution & result, const string & input_frame) {
-    geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now();
-    tf.header.frame_id = "body";
-    tf.child_frame_id = input_frame.empty() ? sanitizeIpToFrame(ip) : input_frame;
-
-    const Matrix3d R_bl = result.R_opt.transpose();
-    const Vector3d t_bl = -R_bl * result.t_opt;
-    tf.transform.translation.x = t_bl.x();
-    tf.transform.translation.y = t_bl.y();
-    tf.transform.translation.z = t_bl.z();
-
-    tf2::Quaternion q;
-    Eigen::Vector3d rpy_bl = R_bl.eulerAngles(0, 1, 2);
-    q.setRPY(rpy_bl.x(), rpy_bl.y(), rpy_bl.z());
-    tf.transform.rotation.x = q.x();
-    tf.transform.rotation.y = q.y();
-    tf.transform.rotation.z = q.z();
-    tf.transform.rotation.w = q.w();
-    tf_broadcaster_->sendTransform(tf);
-  }
-
-  void publishMarkers(const string & ip, const CandidateSolution & result, const string & input_frame) {
-    visualization_msgs::msg::MarkerArray array;
-    int id = 0;
-    for (const auto & m : result.used_measurements) {
-      visualization_msgs::msg::Marker mk;
-      mk.header.stamp = now();
-      mk.header.frame_id = input_frame.empty() ? sanitizeIpToFrame(ip) : input_frame;
-      mk.ns = "planes";
-      mk.id = id++;
-      mk.type = visualization_msgs::msg::Marker::ARROW;
-      mk.action = visualization_msgs::msg::Marker::ADD;
-      mk.scale.x = 0.4;
-      mk.scale.y = 0.06;
-      mk.scale.z = 0.08;
-      mk.color.a = 1.0;
-      mk.color.g = 1.0;
-      geometry_msgs::msg::Point p0, p1;
-      p0.x = 0.0; p0.y = 0.0; p0.z = 0.0;
-      p1.x = m.n_lidar.x() * 0.5;
-      p1.y = m.n_lidar.y() * 0.5;
-      p1.z = m.n_lidar.z() * 0.5;
-      mk.points.push_back(p0);
-      mk.points.push_back(p1);
-      array.markers.push_back(mk);
-    }
-    marker_pub_->publish(array);
-  }
-
-  string config_path_;
-  string target_lidar_ip_;
-  string output_result_path_;
-  string output_cloud_dir_;
-  string figure8_data_path_;
-
-  double accumulation_time_sec_{2.0};
-  double roi_distance_threshold_{0.08};
-  double ransac_distance_threshold_{0.02};
-  int min_plane_points_{300};
-  double voxel_leaf_size_{0.01};
-
-  double wn_{10.0};
-  double wd_{20.0};
-  double wp_{2.0};
-  double wD_{5.0};
-
-  double plane_vis_size_{0.8};
-  double plane_vis_resolution_{0.05};
-  double axis_vis_length_{0.4};
-  double axis_vis_step_{0.01};
-
-  double tx_margin_{0.10};
-  double ty_margin_{0.10};
-  double tz_margin_{0.05};
-  double roll_margin_{deg2rad(10.0)};
-  double pitch_margin_{deg2rad(5.0)};
-  double yaw_margin_{deg2rad(5.0)};
-
-  double strict_max_final_cost_{0.30};
-  double strict_max_normal_angle_error_deg_{8.0};
-  double strict_max_distance_error_m_{0.03};
-  double strict_max_mean_reprojection_error_m_{0.03};
-  double strict_max_dtheta_deg_{5.0};
-  double strict_max_dD_m_{0.03};
-
-  double plane_angle_dev_bound_{deg2rad(5.0)};
-  double plane_offset_dev_bound_{0.03};
-
-  bool enable_multi_seed_{true};
-  double seed_pos_delta_xy_{0.03};
-  double seed_pos_delta_z_{0.02};
-  double seed_roll_delta_{deg2rad(3.0)};
-  double seed_pitch_delta_{deg2rad(2.0)};
-  double seed_yaw_delta_{deg2rad(2.0)};
-
-  bool enable_dynamic_figure8_refine_{false};
-  bool publish_tf_{true};
-  bool save_raw_cloud_{true};
-  bool save_body_cloud_{true};
-  bool save_visualization_cloud_{true};
-
-  map<string, LidarConfig> lidar_configs_;
-  map<string, LidarState> lidar_states_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  Config cfg_;
+  std::string config_path_;
+  std::string target_lidar_ip_;
+  std::string input_topic_;
+  double accumulation_time_sec_{3.0};
+  double roi_distance_threshold_{0.02};
+  double ransac_distance_threshold_{0.01};
+  std::string output_result_path_;
+  std::string output_cloud_dir_;
+
+  bool started_{false};
+  bool finished_{false};
+  builtin_interfaces::msg::Time start_time_;
+  pcl::PointCloud<pcl::PointXYZ>::Ptr raw_accum_cloud_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+  int exit_code_{static_cast<int>(ExitCode::kRuntimeError)};
 };
 
 int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
+  int exit_code = static_cast<int>(ExitCode::kRuntimeError);
   try {
-    auto node = std::make_shared<MultiMid360Calibrator>();
+    auto node = std::make_shared<MultiMid360CalibratorNode>();
     rclcpp::spin(node);
+    exit_code = node->exitCode();
   } catch (const std::exception & e) {
-    fprintf(stderr, "Fatal: %s\n", e.what());
+    std::cerr << "[error] multi_mid360_calibrator fatal: " << e.what() << "\n";
+    exit_code = static_cast<int>(ExitCode::kRuntimeError);
   }
-  rclcpp::shutdown();
-  return 0;
+  if (rclcpp::ok()) {
+    rclcpp::shutdown();
+  }
+  return exit_code;
 }

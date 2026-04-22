@@ -1,54 +1,68 @@
 192.168.1.135:
   topic: /livox/lidar
 
+  # 角度单位：推荐显式写 deg。
+  # 可选：deg | rad
+  angle_unit: deg
+
   # 初始外参（body坐标系下，单位：m / deg）
   x: -0.425
-  y: -0.40
+  y: -0.400
   z: 0.115
   roll: 0.0
   pitch: 22.0
   yaw: 90.0
 
   # 理想平面先验，统一按：n^T p + d = 0
-  # 注意：
-  # [ 1, 0, 0, 0.10]  表示 x = -0.10
-  # [-1, 0, 0, 0.10]  表示 x =  0.10
-  # [ 0, 1, 0, 0.12]  表示 y = -0.12
-  # [ 0, 0,-1, 0.00]  表示 z =  0.00
-  #
-  # 这里建议写“真实可测、离原点有一定距离”的面，
-  # 不建议都写成 0.001 这种过近值。
   planes:
-    - [ 1.0, 0.0, 0.0, 0.01 ]   # 右/左侧参考面之一：x = -0.10
-    - [ 0.0, 1.0, 0.0, 0.01 ]   # 前/后参考面之一：y = -0.10
-    - [ 0.0, 0.0,-1.0, 0.01 ]   # 底面：z = 0.00
+    - [ 1.0, 0.0, 0.0, 0.01 ]
+    - [ 0.0, 1.0, 0.0, 0.01 ]
+    - [ 0.0, 0.0,-1.0, 0.01 ]
 
-  # 每个平面的 LiDAR 坐标系下 ROI 包围盒（可选，但强烈建议）
-  # 顺序必须与 planes 一一对应
-  #
-  # 这些范围不是“最终真值”，而是“提平面时允许搜索的空间范围”
-  # 你需要按实际点云大概分布来调。
+  # 顺序必须与 planes 一一对应；这里是 body 坐标系下 ROI
   plane_rois:
-    # plane 0 对应的 ROI
     - xmin: -0.05
       xmax:  0.03
-      ymin: -0.5
-      ymax:  -0.0
+      ymin: -0.50
+      ymax:  0.00
       zmin: -0.05
-      zmax:  0.5
+      zmax:  0.50
 
-    # plane 1 对应的 ROI
-    - xmin: -0.5
+    - xmin: -0.50
       xmax:  0.03
       ymin: -0.05
       ymax:  0.05
       zmin: -0.05
-      zmax:  0.5
+      zmax:  0.50
 
-    # plane 2 对应的 ROI
-    - xmin: -0.5
+    - xmin: -0.50
       xmax:  0.05
-      ymin: -0.5
+      ymin: -0.50
       ymax:  0.05
       zmin: -0.02
       zmax:  0.06
+
+  # 第一层：必须改 —— 边界配置
+  bounds:
+    dtheta_deg: 5.0          # 每个先验平面允许的小旋转微调边界 ±5°
+    dD_m: 0.05               # 每个先验平面允许的小距离微调边界 ±0.05 m
+    t_xyz_m: [0.10, 0.10, 0.10]   # t 相对初值允许变化范围（±x/±y/±z）
+    rpy_deg: [5.0, 5.0, 5.0]      # rpy 相对初值允许变化范围（±roll/±pitch/±yaw）
+
+  # 第一层：ROI 拟合后，进入优化前的门限检查
+  gates:
+    max_normal_angle_error_deg: 20.0
+    max_plane_distance_error_m: 0.08
+
+  # 第一层：严格验收函数
+  acceptance:
+    strict_max_final_cost: 5.0
+    strict_max_angle_error_deg: 3.0
+    strict_max_distance_error_m: 0.02
+    strict_max_translation_delta_m: 0.10
+    strict_max_rotation_delta_deg: 10.0
+
+  # 第二层：建议改 —— 多初值求解
+  # 0: 只用初值
+  # 1: 启用一组轻量扰动初值（推荐）
+  multi_seed_mode: 1
