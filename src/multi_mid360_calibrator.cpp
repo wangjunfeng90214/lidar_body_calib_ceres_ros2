@@ -54,6 +54,11 @@ enum class LogLevel : int {
   kError = 2,
 };
 
+enum class MeasurementChannel : int {
+  kRaw = 0,
+  kPadding = 1,
+};
+
 struct RoiBox {
   double xmin{-std::numeric_limits<double>::infinity()};
   double xmax{ std::numeric_limits<double>::infinity()};
@@ -128,6 +133,88 @@ struct SolverResult {
   Matrix3d R{Matrix3d::Identity()};
   int seed_index{-1};
   std::vector<PerPlaneDiagnostics> per_plane;
+};
+
+struct ChannelSolveResult {
+  MeasurementChannel channel{MeasurementChannel::kRaw};
+  bool measurement_ok{false};
+  bool solve_ok{false};
+  bool strict_accept{false};
+  std::string failure_reason;
+  std::vector<PlaneMeasurement> measurements;
+  SolverResult solver_result;
+  double max_final_normal_angle_error_deg{1e9};
+  double max_final_plane_distance_error_m{1e9};
+  double mean_final_normal_angle_error_deg{1e9};
+  double mean_final_plane_distance_error_m{1e9};
+  double channel_score{1e18};
+};
+
+struct DualChannelSolveResult {
+  ChannelSolveResult raw;
+  ChannelSolveResult padding;
+  bool has_selected{false};
+  MeasurementChannel selected_channel{MeasurementChannel::kRaw};
+  ChannelSolveResult selected;
+  bool channels_consistent{false};
+  double delta_t_norm_m{1e9};
+  double delta_angle_deg{1e9};
+};
+
+struct CalibrationRunRecord {
+  int run_index{0};
+  std::string timestamp_iso8601;
+  std::string lidar_ip;
+  bool run_success{false};
+  bool strict_accept{false};
+  DualChannelSolveResult dual_result;
+  Vector3d final_t_m{0.0, 0.0, 0.0};
+  Vector3d final_rpy_rad{0.0, 0.0, 0.0};
+  Matrix3d final_R{Matrix3d::Identity()};
+  double final_cost{1e18};
+  int seed_index{-1};
+  std::string selected_channel{"raw"};
+  std::string reject_reason;
+};
+
+struct BatchCalibrationSummary {
+  int requested_runs{0};
+  int completed_runs{0};
+  int accepted_runs{0};
+  int rejected_runs{0};
+  std::vector<CalibrationRunRecord> all_runs;
+  std::vector<int> accepted_run_indices;
+  std::vector<int> rejected_run_indices;
+  Vector3d robust_t_m{0.0, 0.0, 0.0};
+  Eigen::Quaterniond robust_q{1.0, 0.0, 0.0, 0.0};
+  Vector3d robust_rpy_rad{0.0, 0.0, 0.0};
+  Vector3d mean_t_m{0.0, 0.0, 0.0};
+  Vector3d std_t_m{0.0, 0.0, 0.0};
+  Vector3d mean_rpy_deg{0.0, 0.0, 0.0};
+  Vector3d std_rpy_deg{0.0, 0.0, 0.0};
+  double max_pairwise_t_diff_m{0.0};
+  double max_pairwise_angle_diff_deg{0.0};
+  int representative_run_index{-1};
+  std::string aggregation_method{"robust_median_then_select_nearest"};
+  bool batch_stable{false};
+  std::string batch_comment;
+};
+
+struct Figure8VerificationConfig {
+  bool enable{false};
+  std::string data_path;
+  double max_rotation_error_deg{0.5};
+  double max_translation_error_m{0.02};
+};
+
+struct Figure8VerificationResult {
+  bool enabled{false};
+  bool success{false};
+  bool pass{false};
+  double rotation_consistency_deg{1e9};
+  double translation_consistency_m{1e9};
+  std::string summary;
+  std::string reject_reason;
 };
 
 struct BoundsConfig {
@@ -233,6 +320,73 @@ double deg2rad(double deg) {
 
 double rad2deg(double rad) {
   return rad * 180.0 / M_PI;
+}
+
+const char * measurementChannelTag(MeasurementChannel c) {
+  switch (c) {
+    case MeasurementChannel::kRaw: return "raw";
+    case MeasurementChannel::kPadding: return "padding";
+  }
+  return "raw";
+}
+
+std::string nowIso8601Local() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &tt);
+#else
+  localtime_r(&tt, &tm);
+#endif
+  std::ostringstream oss;
+  oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
+  return oss.str();
+}
+
+Eigen::Quaterniond rotationMatrixToQuaternion(const Matrix3d & R) {
+  Eigen::Quaterniond q(R);
+  if (q.w() < 0.0) {
+    q.coeffs() *= -1.0;
+  }
+  return q.normalized();
+}
+
+Vector3d medianTranslation(const std::vector<Vector3d> & ts) {
+  if (ts.empty()) return Vector3d::Zero();
+  Vector3d out;
+  for (int k = 0; k < 3; ++k) {
+    std::vector<double> vals;
+    vals.reserve(ts.size());
+    for (const auto & t : ts) vals.push_back(t[k]);
+    std::sort(vals.begin(), vals.end());
+    const std::size_t n = vals.size();
+    out[k] = (n % 2 == 1) ? vals[n / 2] : 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
+  }
+  return out;
+}
+
+Eigen::Quaterniond averageQuaternionChordal(const std::vector<Eigen::Quaterniond> & quats) {
+  if (quats.empty()) return Eigen::Quaterniond::Identity();
+  Eigen::Matrix4d A = Eigen::Matrix4d::Zero();
+  Eigen::Vector4d ref(quats.front().w(), quats.front().x(), quats.front().y(), quats.front().z());
+  for (auto q : quats) {
+    q.normalize();
+    Eigen::Vector4d v(q.w(), q.x(), q.y(), q.z());
+    if (ref.dot(v) < 0.0) v = -v;
+    A += v * v.transpose();
+  }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> es(A);
+  Eigen::Vector4d v = es.eigenvectors().col(3);
+  Eigen::Quaterniond q(v[0], v[1], v[2], v[3]);
+  if (q.w() < 0.0) q.coeffs() *= -1.0;
+  return q.normalized();
+}
+
+double quaternionAngularDistanceDeg(const Eigen::Quaterniond & a, const Eigen::Quaterniond & b) {
+  const double d = std::abs(a.normalized().dot(b.normalized()));
+  const double c = std::max(-1.0, std::min(1.0, d));
+  return rad2deg(2.0 * std::acos(c));
 }
 
 bool isFiniteVec(const Vector3d & v) {
@@ -1258,6 +1412,338 @@ void ensureDir(const std::string & dir_path) {
   std::filesystem::create_directories(dir_path);
 }
 
+void computeChannelDiagnostics(ChannelSolveResult & r) {
+  if (r.solver_result.per_plane.empty()) return;
+  double max_ang = 0.0, max_dist = 0.0;
+  double sum_ang = 0.0, sum_dist = 0.0;
+  for (const auto & p : r.solver_result.per_plane) {
+    max_ang = std::max(max_ang, p.normal_angle_err_deg);
+    max_dist = std::max(max_dist, std::abs(p.plane_distance_err_m));
+    sum_ang += p.normal_angle_err_deg;
+    sum_dist += std::abs(p.plane_distance_err_m);
+  }
+  const double n = static_cast<double>(r.solver_result.per_plane.size());
+  r.max_final_normal_angle_error_deg = max_ang;
+  r.max_final_plane_distance_error_m = max_dist;
+  r.mean_final_normal_angle_error_deg = sum_ang / n;
+  r.mean_final_plane_distance_error_m = sum_dist / n;
+}
+
+double computeChannelScore(const ChannelSolveResult & r) {
+  if (!r.measurement_ok) return 1e18;
+  if (!r.solve_ok) return 1e17;
+  if (!r.strict_accept) return 1e16 + r.solver_result.final_cost;
+  double score = 0.0;
+  score += 1000.0 * r.max_final_normal_angle_error_deg;
+  score += 5000.0 * r.max_final_plane_distance_error_m;
+  score += r.solver_result.final_cost;
+  std::size_t total_inliers = 0;
+  for (const auto & m : r.measurements) total_inliers += m.inlier_count;
+  score -= 0.001 * static_cast<double>(total_inliers);
+  return score;
+}
+
+ChannelSolveResult runSingleChannel(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+  const YamlInput & yin,
+  const Config & cfg,
+  MeasurementChannel channel,
+  double roi_padding_m)
+{
+  ChannelSolveResult out;
+  out.channel = channel;
+  try {
+    if (channel == MeasurementChannel::kRaw) {
+      out.measurements = extractPlaneMeasurements(cloud, yin, cfg);
+    } else {
+      out.measurements = extractPlaneMeasurementsWithPadding(cloud, yin, cfg, roi_padding_m);
+    }
+    out.measurement_ok = (out.measurements.size() == 3);
+    if (!out.measurement_ok) {
+      out.failure_reason = "measurement count != 3";
+      return out;
+    }
+    out.solver_result = solveCeres(out.measurements, yin, cfg);
+    out.solve_ok = out.solver_result.success;
+    out.strict_accept = out.solver_result.strict_accept;
+    computeChannelDiagnostics(out);
+    out.channel_score = computeChannelScore(out);
+    if (!out.solve_ok) {
+      out.failure_reason = "solver unusable";
+    } else if (!out.strict_accept) {
+      out.failure_reason = "strict acceptance failed";
+    }
+  } catch (const std::exception & e) {
+    out.failure_reason = e.what();
+    out.channel_score = 1e18;
+  }
+  return out;
+}
+
+DualChannelSolveResult runDualChannelSolve(
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+  const YamlInput & yin,
+  const Config & cfg,
+  bool enable_padding_channel,
+  double roi_padding_m)
+{
+  DualChannelSolveResult out;
+  out.raw = runSingleChannel(cloud, yin, cfg, MeasurementChannel::kRaw, roi_padding_m);
+  if (enable_padding_channel) {
+    out.padding = runSingleChannel(cloud, yin, cfg, MeasurementChannel::kPadding, roi_padding_m);
+  } else {
+    out.padding.channel = MeasurementChannel::kPadding;
+    out.padding.failure_reason = "padding channel disabled";
+    out.padding.channel_score = 1e18;
+  }
+
+  if (out.raw.solve_ok && enable_padding_channel && out.padding.solve_ok) {
+    const auto dt = out.raw.solver_result.t_m - out.padding.solver_result.t_m;
+    out.delta_t_norm_m = dt.norm();
+    const Eigen::Quaterniond qr = rotationMatrixToQuaternion(out.raw.solver_result.R);
+    const Eigen::Quaterniond qp = rotationMatrixToQuaternion(out.padding.solver_result.R);
+    out.delta_angle_deg = quaternionAngularDistanceDeg(qr, qp);
+    out.channels_consistent = (out.delta_t_norm_m < 0.005 && out.delta_angle_deg < 0.3);
+  }
+
+  const bool raw_better = out.raw.channel_score <= out.padding.channel_score;
+  out.selected = raw_better ? out.raw : out.padding;
+  out.selected_channel = raw_better ? MeasurementChannel::kRaw : MeasurementChannel::kPadding;
+  out.has_selected = out.selected.measurement_ok;
+  return out;
+}
+
+bool isAcceptedRun(const CalibrationRunRecord & r) {
+  return r.run_success && r.strict_accept;
+}
+
+CalibrationRunRecord processOneRun(
+  int run_index,
+  const std::string & lidar_ip,
+  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud,
+  const YamlInput & yin,
+  const Config & cfg,
+  bool enable_padding_channel,
+  double roi_padding_m)
+{
+  CalibrationRunRecord rec;
+  rec.run_index = run_index;
+  rec.timestamp_iso8601 = nowIso8601Local();
+  rec.lidar_ip = lidar_ip;
+  rec.dual_result = runDualChannelSolve(cloud, yin, cfg, enable_padding_channel, roi_padding_m);
+  rec.run_success = rec.dual_result.has_selected;
+  if (!rec.run_success) {
+    rec.reject_reason = "dual channel solve failed";
+    return rec;
+  }
+  const auto & sel = rec.dual_result.selected;
+  rec.strict_accept = sel.strict_accept;
+  rec.final_t_m = sel.solver_result.t_m;
+  rec.final_rpy_rad = sel.solver_result.rpy_rad;
+  rec.final_R = sel.solver_result.R;
+  rec.final_cost = sel.solver_result.final_cost;
+  rec.seed_index = sel.solver_result.seed_index;
+  rec.selected_channel = measurementChannelTag(rec.dual_result.selected_channel);
+  if (!rec.strict_accept) {
+    rec.reject_reason = sel.failure_reason.empty() ? "strict acceptance failed" : sel.failure_reason;
+  }
+  return rec;
+}
+
+BatchCalibrationSummary aggregateBatchResults(const std::vector<CalibrationRunRecord> & runs) {
+  BatchCalibrationSummary summary;
+  summary.requested_runs = static_cast<int>(runs.size());
+  summary.completed_runs = static_cast<int>(runs.size());
+  summary.all_runs = runs;
+
+  std::vector<Vector3d> accepted_t;
+  std::vector<Eigen::Quaterniond> accepted_q;
+  std::vector<Vector3d> accepted_rpy_deg;
+  std::vector<const CalibrationRunRecord *> accepted_records;
+
+  for (const auto & r : runs) {
+    if (isAcceptedRun(r)) {
+      summary.accepted_run_indices.push_back(r.run_index);
+      accepted_t.push_back(r.final_t_m);
+      accepted_q.push_back(rotationMatrixToQuaternion(r.final_R));
+      accepted_rpy_deg.push_back(Vector3d(rad2deg(r.final_rpy_rad.x()), rad2deg(r.final_rpy_rad.y()), rad2deg(r.final_rpy_rad.z())));
+      accepted_records.push_back(&r);
+    } else {
+      summary.rejected_run_indices.push_back(r.run_index);
+    }
+  }
+  summary.accepted_runs = static_cast<int>(summary.accepted_run_indices.size());
+  summary.rejected_runs = static_cast<int>(summary.rejected_run_indices.size());
+
+  if (accepted_records.empty()) {
+    summary.batch_comment = "no accepted runs";
+    return summary;
+  }
+
+  summary.robust_t_m = medianTranslation(accepted_t);
+  summary.robust_q = averageQuaternionChordal(accepted_q);
+  summary.robust_rpy_rad = summary.robust_q.toRotationMatrix().eulerAngles(2, 1, 0).reverse();
+
+  for (const auto & t : accepted_t) summary.mean_t_m += t;
+  summary.mean_t_m /= static_cast<double>(accepted_t.size());
+  for (const auto & rpy_deg : accepted_rpy_deg) summary.mean_rpy_deg += rpy_deg;
+  summary.mean_rpy_deg /= static_cast<double>(accepted_rpy_deg.size());
+  for (const auto & t : accepted_t) {
+    const Vector3d d = t - summary.mean_t_m;
+    summary.std_t_m += d.cwiseProduct(d);
+  }
+  for (const auto & rpy_deg : accepted_rpy_deg) {
+    const Vector3d d = rpy_deg - summary.mean_rpy_deg;
+    summary.std_rpy_deg += d.cwiseProduct(d);
+  }
+  summary.std_t_m = (summary.std_t_m / static_cast<double>(accepted_t.size())).cwiseSqrt();
+  summary.std_rpy_deg = (summary.std_rpy_deg / static_cast<double>(accepted_rpy_deg.size())).cwiseSqrt();
+
+  double best_dist = 1e18;
+  for (const auto * r : accepted_records) {
+    const double t_dist = (r->final_t_m - summary.robust_t_m).norm();
+    const double q_dist = quaternionAngularDistanceDeg(rotationMatrixToQuaternion(r->final_R), summary.robust_q);
+    const double dist = t_dist + 0.01 * q_dist;
+    if (dist < best_dist) {
+      best_dist = dist;
+      summary.representative_run_index = r->run_index;
+    }
+  }
+
+  for (std::size_t i = 0; i < accepted_records.size(); ++i) {
+    for (std::size_t j = i + 1; j < accepted_records.size(); ++j) {
+      summary.max_pairwise_t_diff_m = std::max(summary.max_pairwise_t_diff_m,
+        (accepted_records[i]->final_t_m - accepted_records[j]->final_t_m).norm());
+      summary.max_pairwise_angle_diff_deg = std::max(summary.max_pairwise_angle_diff_deg,
+        quaternionAngularDistanceDeg(rotationMatrixToQuaternion(accepted_records[i]->final_R),
+                                     rotationMatrixToQuaternion(accepted_records[j]->final_R)));
+    }
+  }
+
+  summary.batch_stable =
+    (summary.accepted_runs >= 3) &&
+    (summary.std_t_m.x() < 0.003) &&
+    (summary.std_t_m.y() < 0.003) &&
+    (summary.std_t_m.z() < 0.005) &&
+    (summary.std_rpy_deg.x() < 0.2) &&
+    (summary.std_rpy_deg.y() < 0.2) &&
+    (summary.std_rpy_deg.z() < 0.2);
+
+  summary.batch_comment = summary.batch_stable ? "stable" : "not stable enough";
+  return summary;
+}
+
+Figure8VerificationResult verifyFigure8(
+  const Figure8VerificationConfig & cfg,
+  const BatchCalibrationSummary & summary)
+{
+  Figure8VerificationResult out;
+  out.enabled = cfg.enable;
+  if (!cfg.enable) return out;
+  if (!summary.batch_stable) {
+    out.success = false;
+    out.pass = false;
+    out.reject_reason = "static batch not stable, skip figure8 verification";
+    return out;
+  }
+  out.success = false;
+  out.pass = false;
+  out.summary = "figure8 verification interface reserved; bag/trajectory backend not implemented in this file";
+  out.reject_reason = cfg.data_path.empty() ? "figure8_data_path is empty" : "figure8 backend pending";
+  return out;
+}
+
+void saveBatchCalibrationYaml(
+  const std::string & output_result_path,
+  const std::string & lidar_ip,
+  const BatchCalibrationSummary & summary,
+  const Figure8VerificationResult & fig8)
+{
+  if (output_result_path.empty()) return;
+  ensureParentDir(output_result_path);
+  YAML::Emitter out;
+  out << YAML::BeginMap;
+  out << YAML::Key << lidar_ip << YAML::Value;
+  out << YAML::BeginMap;
+  out << YAML::Key << "format_version" << YAML::Value << 2;
+  out << YAML::Key << "calibration_mode" << YAML::Value << "static_three_plane_batch";
+  out << YAML::Key << "angle_unit" << YAML::Value << "deg";
+
+  out << YAML::Key << "final_result" << YAML::Value << YAML::BeginMap;
+  if (summary.representative_run_index >= 0) {
+    const auto & rep = summary.all_runs.at(static_cast<std::size_t>(summary.representative_run_index));
+    out << YAML::Key << "x" << YAML::Value << rep.final_t_m.x();
+    out << YAML::Key << "y" << YAML::Value << rep.final_t_m.y();
+    out << YAML::Key << "z" << YAML::Value << rep.final_t_m.z();
+    out << YAML::Key << "roll" << YAML::Value << rad2deg(rep.final_rpy_rad.x());
+    out << YAML::Key << "pitch" << YAML::Value << rad2deg(rep.final_rpy_rad.y());
+    out << YAML::Key << "yaw" << YAML::Value << rad2deg(rep.final_rpy_rad.z());
+    out << YAML::Key << "selected_channel" << YAML::Value << rep.selected_channel;
+    out << YAML::Key << "success" << YAML::Value << rep.run_success;
+    out << YAML::Key << "strict_accept" << YAML::Value << rep.strict_accept;
+  }
+  out << YAML::Key << "representative_run_index" << YAML::Value << summary.representative_run_index;
+  out << YAML::EndMap;
+
+  out << YAML::Key << "aggregate_statistics" << YAML::Value << YAML::BeginMap;
+  out << YAML::Key << "requested_runs" << YAML::Value << summary.requested_runs;
+  out << YAML::Key << "completed_runs" << YAML::Value << summary.completed_runs;
+  out << YAML::Key << "accepted_runs" << YAML::Value << summary.accepted_runs;
+  out << YAML::Key << "rejected_runs" << YAML::Value << summary.rejected_runs;
+  out << YAML::Key << "aggregation_method" << YAML::Value << summary.aggregation_method;
+  out << YAML::Key << "batch_stable" << YAML::Value << summary.batch_stable;
+  out << YAML::Key << "mean_t_m" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.mean_t_m.x() << summary.mean_t_m.y() << summary.mean_t_m.z() << YAML::EndSeq;
+  out << YAML::Key << "std_t_m" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.std_t_m.x() << summary.std_t_m.y() << summary.std_t_m.z() << YAML::EndSeq;
+  out << YAML::Key << "mean_rpy_deg" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.mean_rpy_deg.x() << summary.mean_rpy_deg.y() << summary.mean_rpy_deg.z() << YAML::EndSeq;
+  out << YAML::Key << "std_rpy_deg" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.std_rpy_deg.x() << summary.std_rpy_deg.y() << summary.std_rpy_deg.z() << YAML::EndSeq;
+  out << YAML::Key << "max_pairwise_t_diff_m" << YAML::Value << summary.max_pairwise_t_diff_m;
+  out << YAML::Key << "max_pairwise_angle_diff_deg" << YAML::Value << summary.max_pairwise_angle_diff_deg;
+  out << YAML::Key << "batch_comment" << YAML::Value << summary.batch_comment;
+  out << YAML::EndMap;
+
+  out << YAML::Key << "runs" << YAML::Value << YAML::BeginSeq;
+  for (const auto & run : summary.all_runs) {
+    out << YAML::BeginMap;
+    out << YAML::Key << "run_index" << YAML::Value << run.run_index;
+    out << YAML::Key << "timestamp" << YAML::Value << run.timestamp_iso8601;
+    out << YAML::Key << "run_success" << YAML::Value << run.run_success;
+    out << YAML::Key << "strict_accept" << YAML::Value << run.strict_accept;
+    out << YAML::Key << "selected_channel" << YAML::Value << run.selected_channel;
+    out << YAML::Key << "final_cost" << YAML::Value << run.final_cost;
+    out << YAML::Key << "seed_index" << YAML::Value << run.seed_index;
+    out << YAML::Key << "x" << YAML::Value << run.final_t_m.x();
+    out << YAML::Key << "y" << YAML::Value << run.final_t_m.y();
+    out << YAML::Key << "z" << YAML::Value << run.final_t_m.z();
+    out << YAML::Key << "roll" << YAML::Value << rad2deg(run.final_rpy_rad.x());
+    out << YAML::Key << "pitch" << YAML::Value << rad2deg(run.final_rpy_rad.y());
+    out << YAML::Key << "yaw" << YAML::Value << rad2deg(run.final_rpy_rad.z());
+    out << YAML::Key << "reject_reason" << YAML::Value << run.reject_reason;
+    out << YAML::Key << "channel_consistency" << YAML::Value << YAML::BeginMap;
+    out << YAML::Key << "delta_t_norm_m" << YAML::Value << run.dual_result.delta_t_norm_m;
+    out << YAML::Key << "delta_angle_deg" << YAML::Value << run.dual_result.delta_angle_deg;
+    out << YAML::Key << "channels_consistent" << YAML::Value << run.dual_result.channels_consistent;
+    out << YAML::EndMap;
+    out << YAML::EndMap;
+  }
+  out << YAML::EndSeq;
+
+  out << YAML::Key << "figure8_verification" << YAML::Value << YAML::BeginMap;
+  out << YAML::Key << "enabled" << YAML::Value << fig8.enabled;
+  out << YAML::Key << "success" << YAML::Value << fig8.success;
+  out << YAML::Key << "pass" << YAML::Value << fig8.pass;
+  out << YAML::Key << "rotation_consistency_deg" << YAML::Value << fig8.rotation_consistency_deg;
+  out << YAML::Key << "translation_consistency_m" << YAML::Value << fig8.translation_consistency_m;
+  out << YAML::Key << "summary" << YAML::Value << fig8.summary;
+  out << YAML::Key << "reject_reason" << YAML::Value << fig8.reject_reason;
+  out << YAML::EndMap;
+
+  out << YAML::EndMap;
+  out << YAML::EndMap;
+  std::ofstream ofs(output_result_path);
+  if (!ofs) fail("failed to open output_result_path for write: " + output_result_path);
+  ofs << out.c_str();
+}
+
 void saveSolverResultYaml(
   const std::string & output_result_path,
   const std::string & lidar_ip,
@@ -1352,6 +1838,11 @@ public:
     declare_parameter<int>("multi_seed_mode", 1);
     declare_parameter<std::string>("log_level", "info");
     declare_parameter<std::string>("angle_unit", "");
+    declare_parameter<int>("num_repeats", 5);
+    declare_parameter<bool>("enable_padding_channel", true);
+    declare_parameter<double>("padding_roi_margin_m", 0.02);
+    declare_parameter<bool>("enable_figure8_verification", false);
+    declare_parameter<std::string>("figure8_data_path", "");
 
     get_parameter("config_path", config_path_);
     get_parameter("target_lidar_ip", target_lidar_ip_);
@@ -1361,6 +1852,11 @@ public:
     get_parameter("ransac_distance_threshold", ransac_distance_threshold_);
     get_parameter("output_result_path", output_result_path_);
     get_parameter("output_cloud_dir", output_cloud_dir_);
+    get_parameter("num_repeats", num_repeats_);
+    get_parameter("enable_padding_channel", enable_padding_channel_);
+    get_parameter("padding_roi_margin_m", padding_roi_margin_);
+    get_parameter("enable_figure8_verification", figure8_cfg_.enable);
+    get_parameter("figure8_data_path", figure8_cfg_.data_path);
 
     cfg_.yaml_path = config_path_;
     cfg_.lidar_ip = target_lidar_ip_;
@@ -1375,19 +1871,12 @@ public:
     cfg_.log_level = parseLogLevel(get_parameter("log_level").as_string());
     cfg_.angle_unit_cli = get_parameter("angle_unit").as_string();
 
-    if (config_path_.empty()) {
-      throw std::runtime_error("parameter config_path is empty");
-    }
-    if (target_lidar_ip_.empty()) {
-      throw std::runtime_error("parameter target_lidar_ip is empty");
-    }
-    if (accumulation_time_sec_ <= 0.0) {
-      throw std::runtime_error("accumulation_time_sec must be > 0");
-    }
+    if (config_path_.empty()) throw std::runtime_error("parameter config_path is empty");
+    if (target_lidar_ip_.empty()) throw std::runtime_error("parameter target_lidar_ip is empty");
+    if (accumulation_time_sec_ <= 0.0) throw std::runtime_error("accumulation_time_sec must be > 0");
+    if (num_repeats_ <= 0) throw std::runtime_error("num_repeats must be > 0");
 
-    if (input_topic_.empty()) {
-      input_topic_ = loadTopicFromYaml(config_path_, target_lidar_ip_);
-    }
+    if (input_topic_.empty()) input_topic_ = loadTopicFromYaml(config_path_, target_lidar_ip_);
 
     validateConfig(cfg_);
     ensureDir(output_cloud_dir_);
@@ -1400,6 +1889,9 @@ public:
     RCLCPP_INFO(get_logger(), "accumulation_time_sec: %.3f", accumulation_time_sec_);
     RCLCPP_INFO(get_logger(), "roi_distance_threshold: %.4f", roi_distance_threshold_);
     RCLCPP_INFO(get_logger(), "ransac_distance_threshold: %.4f", ransac_distance_threshold_);
+    RCLCPP_INFO(get_logger(), "num_repeats: %d", num_repeats_);
+    RCLCPP_INFO(get_logger(), "enable_padding_channel: %s", enable_padding_channel_ ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "padding_roi_margin_m: %.4f", padding_roi_margin_);
 
     sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       input_topic_,
@@ -1410,10 +1902,16 @@ public:
   int exitCode() const { return exit_code_; }
 
 private:
+  void resetForNextRun() {
+    started_ = false;
+    raw_accum_cloud_->clear();
+    raw_accum_cloud_->width = 0;
+    raw_accum_cloud_->height = 1;
+    raw_accum_cloud_->is_dense = false;
+  }
+
   void onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    if (finished_) {
-      return;
-    }
+    if (finished_) return;
 
     pcl::PointCloud<pcl::PointXYZ> cloud;
     try {
@@ -1428,7 +1926,7 @@ private:
     if (!started_) {
       start_time_ = msg->header.stamp;
       started_ = true;
-      RCLCPP_INFO(get_logger(), "first cloud received, start accumulation");
+      RCLCPP_INFO(get_logger(), "run %d/%d: first cloud received, start accumulation", current_run_index_ + 1, num_repeats_);
     }
 
     std::size_t appended = 0;
@@ -1445,13 +1943,12 @@ private:
 
     const double elapsed = elapsedSec(msg->header.stamp, start_time_);
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "accumulating... latest_appended=%zu total_points=%zu elapsed=%.3f / %.3f sec",
-      appended, raw_accum_cloud_->points.size(), elapsed, accumulation_time_sec_);
+      "run %d/%d accumulating... latest_appended=%zu total_points=%zu elapsed=%.3f / %.3f sec",
+      current_run_index_ + 1, num_repeats_, appended, raw_accum_cloud_->points.size(), elapsed, accumulation_time_sec_);
 
     if (elapsed >= accumulation_time_sec_) {
-      finished_ = true;
-      finalizeSolve();
-      rclcpp::shutdown();
+      processCurrentRun();
+      if (finished_) rclcpp::shutdown();
     }
   }
 
@@ -1462,7 +1959,7 @@ private:
     return s_now - s_then;
   }
 
-  void finalizeSolve() {
+  void processCurrentRun() {
     try {
       if (!raw_accum_cloud_ || raw_accum_cloud_->empty()) {
         throw std::runtime_error("no accumulated point cloud available for calibration");
@@ -1470,34 +1967,60 @@ private:
 
       if (!output_cloud_dir_.empty()) {
         const std::string raw_pcd = (std::filesystem::path(output_cloud_dir_) /
-          (std::string("lidar_") + sanitizeIp(target_lidar_ip_) + "_accumulated_raw.pcd")).string();
+          (std::string("lidar_") + sanitizeIp(target_lidar_ip_) + "_run_" + std::to_string(current_run_index_) + "_accumulated_raw.pcd")).string();
         pcl::io::savePCDFileBinary(raw_pcd, *raw_accum_cloud_);
         RCLCPP_INFO(get_logger(), "saved accumulated raw cloud to: %s", raw_pcd.c_str());
       }
 
       YamlInput yin = loadYamlInput(cfg_.yaml_path, cfg_.lidar_ip, cfg_);
-      auto measurements = extractPlaneMeasurements(raw_accum_cloud_, yin, cfg_);
-      auto result = solveCeres(measurements, yin, cfg_);
-      printResult(measurements, result, yin);
-      saveSolverResultYaml(output_result_path_, target_lidar_ip_, result, yin, measurements);
+      CalibrationRunRecord rec = processOneRun(
+        current_run_index_, target_lidar_ip_, raw_accum_cloud_, yin, cfg_, enable_padding_channel_, padding_roi_margin_);
+      all_runs_.push_back(rec);
 
-      if (!output_result_path_.empty()) {
-        RCLCPP_INFO(get_logger(), "saved calibration yaml to: %s", output_result_path_.c_str());
+      if (rec.run_success) {
+        printResult(rec.dual_result.selected.measurements, rec.dual_result.selected.solver_result, yin);
+        RCLCPP_INFO(get_logger(), "run %d/%d selected_channel=%s strict_accept=%s final_cost=%.6f",
+          current_run_index_ + 1, num_repeats_, rec.selected_channel.c_str(),
+          rec.strict_accept ? "true" : "false", rec.final_cost);
+      } else {
+        RCLCPP_WARN(get_logger(), "run %d/%d failed: %s", current_run_index_ + 1, num_repeats_, rec.reject_reason.c_str());
       }
 
-      if (!result.success) {
-        exit_code_ = static_cast<int>(ExitCode::kSolveFailed);
-        RCLCPP_ERROR(get_logger(), "solver finished but result is unusable");
-      } else if (!result.strict_accept) {
-        exit_code_ = static_cast<int>(ExitCode::kUsableButNotStrict);
-        RCLCPP_WARN(get_logger(), "solver returned usable result, but strict acceptance failed");
+      ++current_run_index_;
+      if (current_run_index_ >= num_repeats_) {
+        finalizeBatch();
+        finished_ = true;
       } else {
-        exit_code_ = static_cast<int>(ExitCode::kStrictAccept);
-        RCLCPP_INFO(get_logger(), "solver succeeded and strict acceptance passed");
+        resetForNextRun();
       }
     } catch (const std::exception & e) {
       exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
-      RCLCPP_ERROR(get_logger(), "calibration failed: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "processCurrentRun failed: %s", e.what());
+      finished_ = true;
+    }
+  }
+
+  void finalizeBatch() {
+    try {
+      batch_summary_ = aggregateBatchResults(all_runs_);
+      figure8_result_ = verifyFigure8(figure8_cfg_, batch_summary_);
+      saveBatchCalibrationYaml(output_result_path_, target_lidar_ip_, batch_summary_, figure8_result_);
+      if (!output_result_path_.empty()) {
+        RCLCPP_INFO(get_logger(), "saved batch calibration yaml to: %s", output_result_path_.c_str());
+      }
+      if (batch_summary_.accepted_runs <= 0) {
+        exit_code_ = static_cast<int>(ExitCode::kSolveFailed);
+        RCLCPP_ERROR(get_logger(), "batch finished but no accepted runs");
+      } else if (!batch_summary_.batch_stable) {
+        exit_code_ = static_cast<int>(ExitCode::kUsableButNotStrict);
+        RCLCPP_WARN(get_logger(), "batch finished but stability check failed");
+      } else {
+        exit_code_ = static_cast<int>(ExitCode::kStrictAccept);
+        RCLCPP_INFO(get_logger(), "batch finished and stability check passed");
+      }
+    } catch (const std::exception & e) {
+      exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
+      RCLCPP_ERROR(get_logger(), "finalizeBatch failed: %s", e.what());
     }
   }
 
@@ -1518,13 +2041,21 @@ private:
   double ransac_distance_threshold_{0.01};
   std::string output_result_path_;
   std::string output_cloud_dir_;
+  int num_repeats_{5};
+  bool enable_padding_channel_{true};
+  double padding_roi_margin_{0.02};
+  Figure8VerificationConfig figure8_cfg_;
 
   bool started_{false};
   bool finished_{false};
+  int current_run_index_{0};
   builtin_interfaces::msg::Time start_time_;
   pcl::PointCloud<pcl::PointXYZ>::Ptr raw_accum_cloud_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   int exit_code_{static_cast<int>(ExitCode::kRuntimeError)};
+  std::vector<CalibrationRunRecord> all_runs_;
+  BatchCalibrationSummary batch_summary_;
+  Figure8VerificationResult figure8_result_;
 };
 
 int main(int argc, char ** argv) {
