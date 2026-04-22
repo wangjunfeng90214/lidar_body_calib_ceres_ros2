@@ -3,7 +3,7 @@
 <package format="3">
   <name>multi_mid360_calibrator</name>
   <version>0.1.0</version>
-  <description>Mid-360 LiDAR to body extrinsic calibration with cloud export.</description>
+  <description>ROS2 Humble + Ceres multi-Mid360 lidar-to-body extrinsic calibration using body plane priors.</description>
   <maintainer email="user@example.com">OpenAI</maintainer>
   <license>Apache-2.0</license>
 
