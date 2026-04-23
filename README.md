@@ -142,13 +142,12 @@ ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 --ros-args \
 -p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
 -p target_lidar_ip:=192.168.1.135 \
--p input_topic:=/livox/lidar \
+-p input_topic:=/livox/lidar_192_168_1_135 \
 -p accumulation_time_sec:=3.0 \
 -p roi_distance_threshold:=0.02 \
 -p ransac_distance_threshold:=0.01 \
 -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml \
--p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
--p enable_figure8_verification=false
+-p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs \
 ```
 
 
@@ -210,20 +209,81 @@ timestamp_sec,tx,ty,tz,qx,qy,qz,qw
 - 动态微调采用的是“小范围 hand-eye 一致性微调”，是工程上比较稳的第二阶段实现，和 PDF 的定位一致；它不是把静态法完全改写成一个大而全的联合优化器。
 
 建议你这样用：
+
+```bash
+conda deactivate
+rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
+colcon build --packages-select multi_mid360_calibrator
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
+source install/setup.bash 
+```
+
 ```bash
 ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 --ros-args \
--p config_path:=/path/to/lidar_config.yaml \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
 -p target_lidar_ip:=192.168.1.135 \
--p input_topic:=/livox/lidar \
+-p input_topic:=/livox/lidar_192_168_1_135 \
 -p accumulation_time_sec:=3.0 \
--p output_result_path:=/path/to/result.yaml \
--p output_cloud_dir:=/path/to/out_dir \
--p enable_figure8_verification:=true \
--p figure8_data_path:=/path/to/figure8_dataset \
--p figure8_enable_micro_refine:=true
+-p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result.yaml \
+-p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs \
+-p enable_figure8_verification:=false \
+-p figure8_data_path:=/home/wangjunfeng/ros2_ws/output/figure8_dataset \
+-p figure8_enable_micro_refine:=false
 ```
 其中 /path/to/figure8_dataset 目录下放：
 
 - body_trajectory.csv
 - lidar_trajectory.csv
+
+
+# 支持多雷达版本
+核心变化是：
+
+- 支持多雷达同时标定
+- 支持从 YAML 按 雷达 IP → topic 自动匹配
+- 新增 target_lidar_ips 参数，支持逗号分隔多 IP
+- 如果 target_lidar_ips 和 target_lidar_ip 都不填，会自动读取 YAML 顶层的全部雷达 IP
+- 输出结果改为一个 YAML 文件里包含多个雷达的结果
+  
+
+**这版代码的使用方式建议改成：**
+
+```bash
+conda deactivate
+rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
+colcon build --packages-select multi_mid360_calibrator
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
+source install/setup.bash 
+```
+
+```bash
+ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+--ros-args \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
+-p target_lidar_ips:="192.168.1.135,192.168.1.141" \
+-p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result_multi.yaml \
+-p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
+```
+
+也支持只标定一个：
+```bash
+-p target_lidar_ip:=192.168.1.135
+```
+
+还支持完全不传 IP，此时会自动从 YAML 顶层把所有雷达都订阅起来一起标定。
+
+你还需要把 YAML 里的 topic 配成这种形式才行：
+```yaml
+192.168.1.135:
+  topic: /livox/lidar_192_168_1_135
+...
+
+192.168.1.141:
+  topic: /livox/lidar_192_168_1_141
+...
+```
+
+
+# !todo
+需要验证平地 8 字轨迹法

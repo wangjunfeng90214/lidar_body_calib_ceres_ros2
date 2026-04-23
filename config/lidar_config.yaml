@@ -1,5 +1,74 @@
 192.168.1.135:
-  topic: /livox/lidar
+  topic: /livox/lidar_192_168_1_135
+
+  # 角度单位：推荐显式写 deg。
+  # 可选：deg | rad
+  angle_unit: deg
+
+  # 初始外参（body坐标系下，单位：m / deg）
+  x: -0.425
+  y: -0.400
+  z: 0.105
+  roll: 0.0
+  pitch: 22.0
+  yaw: 90.0
+
+  # 理想平面先验，统一按：n^T p + d = 0
+  planes:
+    - [ 1.0, 0.0, 0.0, -0.01 ]
+    - [ 0.0, 1.0, 0.0, 0.01 ]
+    - [ 0.0, 0.0,-1.0, 0.01 ]
+
+  # 顺序必须与 planes 一一对应；这里是 body 坐标系下 ROI
+  plane_rois:
+    - xmin: -0.05
+      xmax:  0.03
+      ymin: -0.50
+      ymax:  0.00
+      zmin: -0.05
+      zmax:  0.50
+
+    - xmin: -0.50
+      xmax:  0.03
+      ymin: -0.05
+      ymax:  0.05
+      zmin: -0.05
+      zmax:  0.50
+
+    - xmin: -0.50
+      xmax:  0.05
+      ymin: -0.50
+      ymax:  0.05
+      zmin: -0.02
+      zmax:  0.06
+
+  # 第一层：必须改 —— 边界配置
+  bounds:
+    dtheta_deg: 5.0          # 每个先验平面允许的小旋转微调边界 ±5°
+    dD_m: 0.05               # 每个先验平面允许的小距离微调边界 ±0.05 m
+    t_xyz_m: [0.10, 0.10, 0.10]   # t 相对初值允许变化范围（±x/±y/±z）
+    rpy_deg: [5.0, 5.0, 5.0]      # rpy 相对初值允许变化范围（±roll/±pitch/±yaw）
+
+  # 第一层：ROI 拟合后，进入优化前的门限检查
+  gates:
+    max_normal_angle_error_deg: 20.0
+    max_plane_distance_error_m: 0.08
+
+  # 第一层：严格验收函数
+  acceptance:
+    strict_max_final_cost: 5.0
+    strict_max_angle_error_deg: 3.0
+    strict_max_distance_error_m: 0.02
+    strict_max_translation_delta_m: 0.10
+    strict_max_rotation_delta_deg: 10.0
+
+  # 第二层：建议改 —— 多初值求解
+  # 0: 只用初值
+  # 1: 启用一组轻量扰动初值（推荐）
+  multi_seed_mode: 1
+
+192.168.1.141:
+  topic: /livox/lidar_192_168_1_141
 
   # 角度单位：推荐显式写 deg。
   # 可选：deg | rad

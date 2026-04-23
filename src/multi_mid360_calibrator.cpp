@@ -22,6 +22,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cctype>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -1821,6 +1822,39 @@ std::string loadTopicFromYaml(const std::string & yaml_path, const std::string &
   return "/livox/lidar";
 }
 
+
+std::vector<std::string> splitCommaSeparated(const std::string & s) {
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+    item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), item.end());
+    if (!item.empty()) out.push_back(item);
+  }
+  return out;
+}
+
+std::vector<std::string> loadAllLidarIpsFromYaml(const std::string & yaml_path) {
+  const YAML::Node root = YAML::LoadFile(yaml_path);
+  if (!root || !root.IsMap()) {
+    fail("yaml root must be a map of lidar_ip -> config");
+  }
+  std::vector<std::string> ips;
+  ips.reserve(root.size());
+  for (auto it = root.begin(); it != root.end(); ++it) {
+    if (!it->first.IsScalar()) continue;
+    const std::string key = it->first.as<std::string>();
+    if (key.empty()) continue;
+    ips.push_back(key);
+  }
+  if (ips.empty()) {
+    fail("no lidar entries found in yaml");
+  }
+  std::sort(ips.begin(), ips.end());
+  return ips;
+}
+
 void ensureParentDir(const std::string & file_path) {
   if (file_path.empty()) return;
   const auto parent = std::filesystem::path(file_path).parent_path();
@@ -2295,6 +2329,121 @@ void saveBatchCalibrationYaml(
   ofs << out.c_str();
 }
 
+
+void saveMultiBatchCalibrationYaml(
+  const std::string & output_result_path,
+  const std::vector<std::string> & lidar_ips,
+  const std::map<std::string, BatchCalibrationSummary> & summaries,
+  const std::map<std::string, Figure8VerificationResult> & fig8_results)
+{
+  if (output_result_path.empty()) return;
+  ensureParentDir(output_result_path);
+  YAML::Emitter out;
+  out << YAML::BeginMap;
+  for (const auto & lidar_ip : lidar_ips) {
+    auto sit = summaries.find(lidar_ip);
+    if (sit == summaries.end()) continue;
+    const auto & summary = sit->second;
+    const auto fit = fig8_results.find(lidar_ip);
+    const Figure8VerificationResult empty_fig8{};
+    const auto & fig8 = (fit != fig8_results.end()) ? fit->second : empty_fig8;
+
+    out << YAML::Key << lidar_ip << YAML::Value;
+    out << YAML::BeginMap;
+    out << YAML::Key << "format_version" << YAML::Value << 2;
+    out << YAML::Key << "calibration_mode" << YAML::Value << "static_three_plane_batch";
+    out << YAML::Key << "angle_unit" << YAML::Value << "deg";
+
+    out << YAML::Key << "final_result" << YAML::Value << YAML::BeginMap;
+    if (summary.representative_run_index >= 0) {
+      const auto & rep = summary.all_runs.at(static_cast<std::size_t>(summary.representative_run_index));
+      out << YAML::Key << "x" << YAML::Value << rep.final_t_m.x();
+      out << YAML::Key << "y" << YAML::Value << rep.final_t_m.y();
+      out << YAML::Key << "z" << YAML::Value << rep.final_t_m.z();
+      out << YAML::Key << "roll" << YAML::Value << rad2deg(rep.final_rpy_rad.x());
+      out << YAML::Key << "pitch" << YAML::Value << rad2deg(rep.final_rpy_rad.y());
+      out << YAML::Key << "yaw" << YAML::Value << rad2deg(rep.final_rpy_rad.z());
+      out << YAML::Key << "selected_channel" << YAML::Value << rep.selected_channel;
+      out << YAML::Key << "success" << YAML::Value << rep.run_success;
+      out << YAML::Key << "strict_accept" << YAML::Value << rep.strict_accept;
+    }
+    out << YAML::Key << "representative_run_index" << YAML::Value << summary.representative_run_index;
+    out << YAML::EndMap;
+
+    out << YAML::Key << "aggregate_statistics" << YAML::Value << YAML::BeginMap;
+    out << YAML::Key << "requested_runs" << YAML::Value << summary.requested_runs;
+    out << YAML::Key << "completed_runs" << YAML::Value << summary.completed_runs;
+    out << YAML::Key << "accepted_runs" << YAML::Value << summary.accepted_runs;
+    out << YAML::Key << "rejected_runs" << YAML::Value << summary.rejected_runs;
+    out << YAML::Key << "aggregation_method" << YAML::Value << summary.aggregation_method;
+    out << YAML::Key << "batch_stable" << YAML::Value << summary.batch_stable;
+    out << YAML::Key << "mean_t_m" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.mean_t_m.x() << summary.mean_t_m.y() << summary.mean_t_m.z() << YAML::EndSeq;
+    out << YAML::Key << "std_t_m" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.std_t_m.x() << summary.std_t_m.y() << summary.std_t_m.z() << YAML::EndSeq;
+    out << YAML::Key << "mean_rpy_deg" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.mean_rpy_deg.x() << summary.mean_rpy_deg.y() << summary.mean_rpy_deg.z() << YAML::EndSeq;
+    out << YAML::Key << "std_rpy_deg" << YAML::Value << YAML::Flow << YAML::BeginSeq << summary.std_rpy_deg.x() << summary.std_rpy_deg.y() << summary.std_rpy_deg.z() << YAML::EndSeq;
+    out << YAML::Key << "max_pairwise_t_diff_m" << YAML::Value << summary.max_pairwise_t_diff_m;
+    out << YAML::Key << "max_pairwise_angle_diff_deg" << YAML::Value << summary.max_pairwise_angle_diff_deg;
+    out << YAML::Key << "batch_comment" << YAML::Value << summary.batch_comment;
+    out << YAML::EndMap;
+
+    out << YAML::Key << "runs" << YAML::Value << YAML::BeginSeq;
+    for (const auto & run : summary.all_runs) {
+      out << YAML::BeginMap;
+      out << YAML::Key << "run_index" << YAML::Value << run.run_index;
+      out << YAML::Key << "timestamp" << YAML::Value << run.timestamp_iso8601;
+      out << YAML::Key << "run_success" << YAML::Value << run.run_success;
+      out << YAML::Key << "strict_accept" << YAML::Value << run.strict_accept;
+      out << YAML::Key << "selected_channel" << YAML::Value << run.selected_channel;
+      out << YAML::Key << "final_cost" << YAML::Value << run.final_cost;
+      out << YAML::Key << "seed_index" << YAML::Value << run.seed_index;
+      out << YAML::Key << "x" << YAML::Value << run.final_t_m.x();
+      out << YAML::Key << "y" << YAML::Value << run.final_t_m.y();
+      out << YAML::Key << "z" << YAML::Value << run.final_t_m.z();
+      out << YAML::Key << "roll" << YAML::Value << rad2deg(run.final_rpy_rad.x());
+      out << YAML::Key << "pitch" << YAML::Value << rad2deg(run.final_rpy_rad.y());
+      out << YAML::Key << "yaw" << YAML::Value << rad2deg(run.final_rpy_rad.z());
+      out << YAML::Key << "reject_reason" << YAML::Value << run.reject_reason;
+      out << YAML::Key << "channel_consistency" << YAML::Value << YAML::BeginMap;
+      out << YAML::Key << "delta_t_norm_m" << YAML::Value << run.dual_result.delta_t_norm_m;
+      out << YAML::Key << "delta_angle_deg" << YAML::Value << run.dual_result.delta_angle_deg;
+      out << YAML::Key << "channels_consistent" << YAML::Value << run.dual_result.channels_consistent;
+      out << YAML::EndMap;
+      out << YAML::EndMap;
+    }
+    out << YAML::EndSeq;
+
+    out << YAML::Key << "figure8_verification" << YAML::Value << YAML::BeginMap;
+    out << YAML::Key << "enabled" << YAML::Value << fig8.enabled;
+    out << YAML::Key << "success" << YAML::Value << fig8.success;
+    out << YAML::Key << "pass" << YAML::Value << fig8.pass;
+    out << YAML::Key << "matched_pose_pairs" << YAML::Value << fig8.matched_pose_pairs;
+    out << YAML::Key << "motion_pairs" << YAML::Value << fig8.motion_pairs;
+    out << YAML::Key << "estimated_time_offset_sec" << YAML::Value << fig8.estimated_time_offset_sec;
+    out << YAML::Key << "rotation_consistency_deg" << YAML::Value << fig8.rotation_consistency_deg;
+    out << YAML::Key << "translation_consistency_m" << YAML::Value << fig8.translation_consistency_m;
+    out << YAML::Key << "refined_result_available" << YAML::Value << fig8.refined_result_available;
+    if (fig8.refined_result_available) {
+      out << YAML::Key << "refined_result" << YAML::Value << YAML::BeginMap;
+      out << YAML::Key << "x" << YAML::Value << fig8.refined_t_m.x();
+      out << YAML::Key << "y" << YAML::Value << fig8.refined_t_m.y();
+      out << YAML::Key << "z" << YAML::Value << fig8.refined_t_m.z();
+      out << YAML::Key << "roll_rad" << YAML::Value << fig8.refined_rpy_rad.x();
+      out << YAML::Key << "pitch_rad" << YAML::Value << fig8.refined_rpy_rad.y();
+      out << YAML::Key << "yaw_rad" << YAML::Value << fig8.refined_rpy_rad.z();
+      out << YAML::EndMap;
+    }
+    out << YAML::Key << "summary" << YAML::Value << fig8.summary;
+    out << YAML::Key << "reject_reason" << YAML::Value << fig8.reject_reason;
+    out << YAML::EndMap;
+
+    out << YAML::EndMap;
+  }
+  out << YAML::EndMap;
+  std::ofstream ofs(output_result_path);
+  if (!ofs) fail("failed to open output_result_path for write: " + output_result_path);
+  ofs << out.c_str();
+}
+
 void saveSolverResultYaml(
   const std::string & output_result_path,
   const std::string & lidar_ip,
@@ -2367,6 +2516,7 @@ void saveSolverResultYaml(
 }  // namespace
 
 
+
 class MultiMid360CalibratorNode : public rclcpp::Node {
 public:
   MultiMid360CalibratorNode()
@@ -2374,6 +2524,7 @@ public:
   {
     declare_parameter<std::string>("config_path", "");
     declare_parameter<std::string>("target_lidar_ip", "");
+    declare_parameter<std::string>("target_lidar_ips", "");
     declare_parameter<std::string>("input_topic", "");
     declare_parameter<double>("accumulation_time_sec", 3.0);
     declare_parameter<double>("roi_distance_threshold", 0.02);
@@ -2408,6 +2559,7 @@ public:
 
     get_parameter("config_path", config_path_);
     get_parameter("target_lidar_ip", target_lidar_ip_);
+    get_parameter("target_lidar_ips", target_lidar_ips_csv_);
     get_parameter("input_topic", input_topic_);
     get_parameter("accumulation_time_sec", accumulation_time_sec_);
     get_parameter("roi_distance_threshold", roi_distance_threshold_);
@@ -2417,48 +2569,45 @@ public:
     get_parameter("num_repeats", num_repeats_);
     get_parameter("enable_padding_channel", enable_padding_channel_);
     get_parameter("padding_roi_margin_m", padding_roi_margin_);
-    get_parameter("enable_figure8_verification", figure8_cfg_.enable);
-    get_parameter("figure8_data_path", figure8_cfg_.data_path);
-    get_parameter("figure8_enable_micro_refine", figure8_cfg_.enable_micro_refine);
-    get_parameter("figure8_replace_final_result_on_success", figure8_cfg_.replace_final_result_on_success);
-    get_parameter("figure8_max_rotation_error_deg", figure8_cfg_.max_rotation_error_deg);
-    get_parameter("figure8_max_translation_error_m", figure8_cfg_.max_translation_error_m);
-    get_parameter("figure8_max_time_offset_sec", figure8_cfg_.max_time_offset_sec);
-    get_parameter("figure8_time_offset_step_sec", figure8_cfg_.time_offset_step_sec);
-    get_parameter("figure8_association_tolerance_sec", figure8_cfg_.association_tolerance_sec);
-    get_parameter("figure8_min_relative_translation_m", figure8_cfg_.min_relative_translation_m);
-    get_parameter("figure8_min_relative_rotation_deg", figure8_cfg_.min_relative_rotation_deg);
-    figure8_cfg_.min_motion_pairs = get_parameter("figure8_min_motion_pairs").as_int();
-    figure8_cfg_.max_num_iterations = get_parameter("figure8_max_num_iterations").as_int();
+    get_parameter("enable_figure8_verification", figure8_cfg_template_.enable);
+    get_parameter("figure8_data_path", figure8_cfg_template_.data_path);
+    get_parameter("figure8_enable_micro_refine", figure8_cfg_template_.enable_micro_refine);
+    get_parameter("figure8_replace_final_result_on_success", figure8_cfg_template_.replace_final_result_on_success);
+    get_parameter("figure8_max_rotation_error_deg", figure8_cfg_template_.max_rotation_error_deg);
+    get_parameter("figure8_max_translation_error_m", figure8_cfg_template_.max_translation_error_m);
+    get_parameter("figure8_max_time_offset_sec", figure8_cfg_template_.max_time_offset_sec);
+    get_parameter("figure8_time_offset_step_sec", figure8_cfg_template_.time_offset_step_sec);
+    get_parameter("figure8_association_tolerance_sec", figure8_cfg_template_.association_tolerance_sec);
+    get_parameter("figure8_min_relative_translation_m", figure8_cfg_template_.min_relative_translation_m);
+    get_parameter("figure8_min_relative_rotation_deg", figure8_cfg_template_.min_relative_rotation_deg);
+    figure8_cfg_template_.min_motion_pairs = get_parameter("figure8_min_motion_pairs").as_int();
+    figure8_cfg_template_.max_num_iterations = get_parameter("figure8_max_num_iterations").as_int();
 
-    cfg_.yaml_path = config_path_;
-    cfg_.lidar_ip = target_lidar_ip_;
-    cfg_.ransac_distance_threshold = ransac_distance_threshold_;
-    cfg_.min_plane_points = get_parameter("min_plane_points").as_int();
-    cfg_.ransac_iterations = get_parameter("ransac_iterations").as_int();
-    cfg_.wn = get_parameter("wn").as_double();
-    cfg_.wd = get_parameter("wd").as_double();
-    cfg_.wp = get_parameter("wp").as_double();
-    cfg_.wD = get_parameter("wD").as_double();
-    cfg_.multi_seed_mode = get_parameter("multi_seed_mode").as_int();
-    cfg_.log_level = parseLogLevel(get_parameter("log_level").as_string());
-    cfg_.angle_unit_cli = get_parameter("angle_unit").as_string();
+    base_cfg_.yaml_path = config_path_;
+    base_cfg_.ransac_distance_threshold = ransac_distance_threshold_;
+    base_cfg_.min_plane_points = get_parameter("min_plane_points").as_int();
+    base_cfg_.ransac_iterations = get_parameter("ransac_iterations").as_int();
+    base_cfg_.wn = get_parameter("wn").as_double();
+    base_cfg_.wd = get_parameter("wd").as_double();
+    base_cfg_.wp = get_parameter("wp").as_double();
+    base_cfg_.wD = get_parameter("wD").as_double();
+    base_cfg_.multi_seed_mode = get_parameter("multi_seed_mode").as_int();
+    base_cfg_.log_level = parseLogLevel(get_parameter("log_level").as_string());
+    base_cfg_.angle_unit_cli = get_parameter("angle_unit").as_string();
 
     if (config_path_.empty()) throw std::runtime_error("parameter config_path is empty");
-    if (target_lidar_ip_.empty()) throw std::runtime_error("parameter target_lidar_ip is empty");
     if (accumulation_time_sec_ <= 0.0) throw std::runtime_error("accumulation_time_sec must be > 0");
     if (num_repeats_ <= 0) throw std::runtime_error("num_repeats must be > 0");
 
-    if (input_topic_.empty()) input_topic_ = loadTopicFromYaml(config_path_, target_lidar_ip_);
+    target_lidar_ips_ = resolveTargetLidarIps();
+    if (target_lidar_ips_.empty()) {
+      throw std::runtime_error("no target lidar ips resolved");
+    }
 
-    validateConfig(cfg_);
+    validateConfig(base_cfg_);
     ensureDir(output_cloud_dir_);
-    raw_accum_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
-    raw_accum_cloud_->reserve(300000);
 
     RCLCPP_INFO(get_logger(), "config_path: %s", config_path_.c_str());
-    RCLCPP_INFO(get_logger(), "target_lidar_ip: %s", target_lidar_ip_.c_str());
-    RCLCPP_INFO(get_logger(), "input_topic: %s", input_topic_.c_str());
     RCLCPP_INFO(get_logger(), "accumulation_time_sec: %.3f", accumulation_time_sec_);
     RCLCPP_INFO(get_logger(), "roi_distance_threshold: %.4f", roi_distance_threshold_);
     RCLCPP_INFO(get_logger(), "ransac_distance_threshold: %.4f", ransac_distance_threshold_);
@@ -2466,40 +2615,100 @@ public:
     RCLCPP_INFO(get_logger(), "enable_padding_channel: %s", enable_padding_channel_ ? "true" : "false");
     RCLCPP_INFO(get_logger(), "padding_roi_margin_m: %.4f", padding_roi_margin_);
 
-    sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      input_topic_,
-      rclcpp::SensorDataQoS(),
-      std::bind(&MultiMid360CalibratorNode::onCloud, this, std::placeholders::_1));
+    setupLidarStates();
   }
 
   int exitCode() const { return exit_code_; }
 
 private:
-  void resetForNextRun() {
-    started_ = false;
-    raw_accum_cloud_->clear();
-    raw_accum_cloud_->width = 0;
-    raw_accum_cloud_->height = 1;
-    raw_accum_cloud_->is_dense = false;
+  struct PerLidarState {
+    std::string lidar_ip;
+    std::string input_topic;
+    Config cfg;
+    Figure8VerificationConfig figure8_cfg;
+
+    bool started{false};
+    bool finished{false};
+    int current_run_index{0};
+    builtin_interfaces::msg::Time start_time{};
+    pcl::PointCloud<pcl::PointXYZ>::Ptr raw_accum_cloud;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub;
+    std::vector<CalibrationRunRecord> all_runs;
+    BatchCalibrationSummary batch_summary;
+    Figure8VerificationResult figure8_result;
+  };
+
+  std::vector<std::string> resolveTargetLidarIps() const {
+    if (!target_lidar_ips_csv_.empty()) {
+      return splitCommaSeparated(target_lidar_ips_csv_);
+    }
+    if (!target_lidar_ip_.empty()) {
+      return {target_lidar_ip_};
+    }
+    return loadAllLidarIpsFromYaml(config_path_);
   }
 
-  void onCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+  void setupLidarStates() {
+    if (!input_topic_.empty() && target_lidar_ips_.size() != 1) {
+      throw std::runtime_error("parameter input_topic can only be used when exactly one lidar is selected");
+    }
+
+    for (const auto & lidar_ip : target_lidar_ips_) {
+      PerLidarState st;
+      st.lidar_ip = lidar_ip;
+      st.input_topic = (!input_topic_.empty() && target_lidar_ips_.size() == 1)
+        ? input_topic_
+        : loadTopicFromYaml(config_path_, lidar_ip);
+      st.cfg = base_cfg_;
+      st.cfg.lidar_ip = lidar_ip;
+      st.figure8_cfg = figure8_cfg_template_;
+      st.raw_accum_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
+      st.raw_accum_cloud->reserve(300000);
+
+      RCLCPP_INFO(get_logger(), "target_lidar_ip: %s", lidar_ip.c_str());
+      RCLCPP_INFO(get_logger(), "input_topic[%s]: %s", lidar_ip.c_str(), st.input_topic.c_str());
+
+      auto sub = create_subscription<sensor_msgs::msg::PointCloud2>(
+        st.input_topic,
+        rclcpp::SensorDataQoS(),
+        [this, lidar_ip](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+          this->onCloud(lidar_ip, msg);
+        });
+      st.sub = sub;
+      lidar_states_.emplace(lidar_ip, std::move(st));
+    }
+  }
+
+  void resetForNextRun(PerLidarState & st) {
+    st.started = false;
+    st.raw_accum_cloud->clear();
+    st.raw_accum_cloud->width = 0;
+    st.raw_accum_cloud->height = 1;
+    st.raw_accum_cloud->is_dense = false;
+  }
+
+  void onCloud(const std::string & lidar_ip, const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (finished_) return;
+    auto it = lidar_states_.find(lidar_ip);
+    if (it == lidar_states_.end()) return;
+    auto & st = it->second;
+    if (st.finished) return;
 
     pcl::PointCloud<pcl::PointXYZ> cloud;
     try {
       pcl::fromROSMsg(*msg, cloud);
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "failed to convert PointCloud2 to PCL: %s", e.what());
-      finished_ = true;
-      rclcpp::shutdown();
+      RCLCPP_ERROR(get_logger(), "[%s] failed to convert PointCloud2 to PCL: %s", lidar_ip.c_str(), e.what());
+      st.finished = true;
+      maybeFinalizeAll();
       return;
     }
 
-    if (!started_) {
-      start_time_ = msg->header.stamp;
-      started_ = true;
-      RCLCPP_INFO(get_logger(), "run %d/%d: first cloud received, start accumulation", current_run_index_ + 1, num_repeats_);
+    if (!st.started) {
+      st.start_time = msg->header.stamp;
+      st.started = true;
+      RCLCPP_INFO(get_logger(), "[%s] run %d/%d: first cloud received, start accumulation", lidar_ip.c_str(), st.current_run_index + 1, num_repeats_);
     }
 
     std::size_t appended = 0;
@@ -2507,20 +2716,20 @@ private:
       if (!pcl::isFinite(pt)) continue;
       const Vector3d p(pt.x, pt.y, pt.z);
       if (!isReasonablePoint(p)) continue;
-      raw_accum_cloud_->points.push_back(pt);
+      st.raw_accum_cloud->points.push_back(pt);
       ++appended;
     }
-    raw_accum_cloud_->width = static_cast<std::uint32_t>(raw_accum_cloud_->points.size());
-    raw_accum_cloud_->height = 1;
-    raw_accum_cloud_->is_dense = false;
+    st.raw_accum_cloud->width = static_cast<std::uint32_t>(st.raw_accum_cloud->points.size());
+    st.raw_accum_cloud->height = 1;
+    st.raw_accum_cloud->is_dense = false;
 
-    const double elapsed = elapsedSec(msg->header.stamp, start_time_);
+    const double elapsed = elapsedSec(msg->header.stamp, st.start_time);
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "run %d/%d accumulating... latest_appended=%zu total_points=%zu elapsed=%.3f / %.3f sec",
-      current_run_index_ + 1, num_repeats_, appended, raw_accum_cloud_->points.size(), elapsed, accumulation_time_sec_);
+      "[%s] run %d/%d accumulating... latest_appended=%zu total_points=%zu elapsed=%.3f / %.3f sec",
+      lidar_ip.c_str(), st.current_run_index + 1, num_repeats_, appended, st.raw_accum_cloud->points.size(), elapsed, accumulation_time_sec_);
 
     if (elapsed >= accumulation_time_sec_) {
-      processCurrentRun();
+      processCurrentRun(st);
       if (finished_) rclcpp::shutdown();
     }
   }
@@ -2532,85 +2741,139 @@ private:
     return s_now - s_then;
   }
 
-  void processCurrentRun() {
+  void processCurrentRun(PerLidarState & st) {
     try {
-      if (!raw_accum_cloud_ || raw_accum_cloud_->empty()) {
+      if (!st.raw_accum_cloud || st.raw_accum_cloud->empty()) {
         throw std::runtime_error("no accumulated point cloud available for calibration");
       }
 
       if (!output_cloud_dir_.empty()) {
         const std::string raw_pcd = (std::filesystem::path(output_cloud_dir_) /
-          (std::string("lidar_") + sanitizeIp(target_lidar_ip_) + "_run_" + std::to_string(current_run_index_) + "_accumulated_raw.pcd")).string();
-        pcl::io::savePCDFileBinary(raw_pcd, *raw_accum_cloud_);
-        RCLCPP_INFO(get_logger(), "saved accumulated raw cloud to: %s", raw_pcd.c_str());
+          (std::string("lidar_") + sanitizeIp(st.lidar_ip) + "_run_" + std::to_string(st.current_run_index) + "_accumulated_raw.pcd")).string();
+        pcl::io::savePCDFileBinary(raw_pcd, *st.raw_accum_cloud);
+        RCLCPP_INFO(get_logger(), "[%s] saved accumulated raw cloud to: %s", st.lidar_ip.c_str(), raw_pcd.c_str());
       }
 
-      YamlInput yin = loadYamlInput(cfg_.yaml_path, cfg_.lidar_ip, cfg_);
+      YamlInput yin = loadYamlInput(st.cfg.yaml_path, st.cfg.lidar_ip, st.cfg);
       CalibrationRunRecord rec = processOneRun(
-        current_run_index_, target_lidar_ip_, raw_accum_cloud_, yin, cfg_, enable_padding_channel_, padding_roi_margin_);
-      all_runs_.push_back(rec);
+        st.current_run_index, st.lidar_ip, st.raw_accum_cloud, yin, st.cfg, enable_padding_channel_, padding_roi_margin_);
+      st.all_runs.push_back(rec);
 
       if (rec.run_success) {
         printResult(rec.dual_result.selected.measurements, rec.dual_result.selected.solver_result, yin);
-        RCLCPP_INFO(get_logger(), "run %d/%d selected_channel=%s strict_accept=%s final_cost=%.6f",
-          current_run_index_ + 1, num_repeats_, rec.selected_channel.c_str(),
+        RCLCPP_INFO(get_logger(), "[%s] run %d/%d selected_channel=%s strict_accept=%s final_cost=%.6f",
+          st.lidar_ip.c_str(), st.current_run_index + 1, num_repeats_, rec.selected_channel.c_str(),
           rec.strict_accept ? "true" : "false", rec.final_cost);
       } else {
-        RCLCPP_WARN(get_logger(), "run %d/%d failed: %s", current_run_index_ + 1, num_repeats_, rec.reject_reason.c_str());
+        RCLCPP_WARN(get_logger(), "[%s] run %d/%d failed: %s", st.lidar_ip.c_str(), st.current_run_index + 1, num_repeats_, rec.reject_reason.c_str());
       }
 
-      ++current_run_index_;
-      if (current_run_index_ >= num_repeats_) {
-        finalizeBatch();
-        finished_ = true;
+      ++st.current_run_index;
+      if (st.current_run_index >= num_repeats_) {
+        finalizeLidar(st);
+        st.finished = true;
+        maybeFinalizeAll();
       } else {
-        resetForNextRun();
+        resetForNextRun(st);
       }
     } catch (const std::exception & e) {
       exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
-      RCLCPP_ERROR(get_logger(), "processCurrentRun failed: %s", e.what());
-      finished_ = true;
+      RCLCPP_ERROR(get_logger(), "[%s] processCurrentRun failed: %s", st.lidar_ip.c_str(), e.what());
+      st.finished = true;
+      maybeFinalizeAll();
     }
   }
 
-  void finalizeBatch() {
+  void finalizeLidar(PerLidarState & st) {
     try {
-      batch_summary_ = aggregateBatchResults(all_runs_);
-      figure8_result_ = verifyFigure8(figure8_cfg_, batch_summary_);
-      if (figure8_result_.success &&
-        figure8_result_.pass &&
-        figure8_result_.refined_result_available &&
-        figure8_cfg_.replace_final_result_on_success &&
-        batch_summary_.representative_run_index >= 0 &&
-        batch_summary_.representative_run_index < static_cast<int>(batch_summary_.all_runs.size())) {
+      st.batch_summary = aggregateBatchResults(st.all_runs);
+      st.figure8_result = verifyFigure8(st.figure8_cfg, st.batch_summary);
+      if (st.figure8_result.success &&
+        st.figure8_result.pass &&
+        st.figure8_result.refined_result_available &&
+        st.figure8_cfg.replace_final_result_on_success &&
+        st.batch_summary.representative_run_index >= 0 &&
+        st.batch_summary.representative_run_index < static_cast<int>(st.batch_summary.all_runs.size())) {
 
-          auto & rep = batch_summary_.all_runs[batch_summary_.representative_run_index];
-          rep.final_rpy_rad = figure8_result_.refined_rpy_rad;
-          rep.final_t_m = figure8_result_.refined_t_m;
-          rep.final_R = rpyToR(rep.final_rpy_rad);
+        auto & rep = st.batch_summary.all_runs[st.batch_summary.representative_run_index];
+        rep.final_rpy_rad = st.figure8_result.refined_rpy_rad;
+        rep.final_t_m = st.figure8_result.refined_t_m;
+        rep.final_R = rpyToR(rep.final_rpy_rad);
 
-          batch_summary_.robust_rpy_rad = rep.final_rpy_rad;
-          batch_summary_.robust_t_m = rep.final_t_m;
-          batch_summary_.robust_q = rotationMatrixToQuaternion(rep.final_R);
+        st.batch_summary.robust_rpy_rad = rep.final_rpy_rad;
+        st.batch_summary.robust_t_m = rep.final_t_m;
+        st.batch_summary.robust_q = rotationMatrixToQuaternion(rep.final_R);
       }
 
-      saveBatchCalibrationYaml(output_result_path_, target_lidar_ip_, batch_summary_, figure8_result_);
-      if (!output_result_path_.empty()) {
-        RCLCPP_INFO(get_logger(), "saved batch calibration yaml to: %s", output_result_path_.c_str());
-      }
-      if (batch_summary_.accepted_runs <= 0) {
-        exit_code_ = static_cast<int>(ExitCode::kSolveFailed);
-        RCLCPP_ERROR(get_logger(), "batch finished but no accepted runs");
-      } else if (!batch_summary_.batch_stable) {
-        exit_code_ = static_cast<int>(ExitCode::kUsableButNotStrict);
-        RCLCPP_WARN(get_logger(), "batch finished but stability check failed");
+      if (st.batch_summary.accepted_runs <= 0) {
+        RCLCPP_ERROR(get_logger(), "[%s] batch finished but no accepted runs", st.lidar_ip.c_str());
+      } else if (!st.batch_summary.batch_stable) {
+        RCLCPP_WARN(get_logger(), "[%s] batch finished but stability check failed", st.lidar_ip.c_str());
       } else {
-        exit_code_ = static_cast<int>(ExitCode::kStrictAccept);
-        RCLCPP_INFO(get_logger(), "batch finished and stability check passed");
+        RCLCPP_INFO(get_logger(), "[%s] batch finished and stability check passed", st.lidar_ip.c_str());
       }
     } catch (const std::exception & e) {
       exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
-      RCLCPP_ERROR(get_logger(), "finalizeBatch failed: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "[%s] finalizeLidar failed: %s", st.lidar_ip.c_str(), e.what());
+    }
+  }
+
+  void maybeFinalizeAll() {
+    bool all_done = !lidar_states_.empty();
+    for (const auto & kv : lidar_states_) {
+      if (!kv.second.finished) {
+        all_done = false;
+        break;
+      }
+    }
+    if (!all_done || finished_) return;
+    finished_ = true;
+    finalizeAll();
+  }
+
+  void finalizeAll() {
+    try {
+      std::map<std::string, BatchCalibrationSummary> summaries;
+      std::map<std::string, Figure8VerificationResult> fig8_results;
+      bool has_runtime_error = (exit_code_ == static_cast<int>(ExitCode::kRuntimeError));
+      bool all_strict = true;
+      bool any_accepted = false;
+
+      for (const auto & ip : target_lidar_ips_) {
+        const auto it = lidar_states_.find(ip);
+        if (it == lidar_states_.end()) continue;
+        const auto & st = it->second;
+        summaries.emplace(ip, st.batch_summary);
+        fig8_results.emplace(ip, st.figure8_result);
+
+        if (st.batch_summary.accepted_runs > 0) any_accepted = true;
+        if (st.batch_summary.accepted_runs <= 0) {
+          all_strict = false;
+        } else if (!st.batch_summary.batch_stable) {
+          all_strict = false;
+        }
+      }
+
+      saveMultiBatchCalibrationYaml(output_result_path_, target_lidar_ips_, summaries, fig8_results);
+      if (!output_result_path_.empty()) {
+        RCLCPP_INFO(get_logger(), "saved multi-lidar batch calibration yaml to: %s", output_result_path_.c_str());
+      }
+
+      if (has_runtime_error) {
+        exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
+      } else if (!any_accepted) {
+        exit_code_ = static_cast<int>(ExitCode::kSolveFailed);
+        RCLCPP_ERROR(get_logger(), "all lidar batches finished but no accepted runs");
+      } else if (!all_strict) {
+        exit_code_ = static_cast<int>(ExitCode::kUsableButNotStrict);
+        RCLCPP_WARN(get_logger(), "multi-lidar batch finished but at least one lidar failed stability/acceptance");
+      } else {
+        exit_code_ = static_cast<int>(ExitCode::kStrictAccept);
+        RCLCPP_INFO(get_logger(), "multi-lidar batch finished and all lidar stability checks passed");
+      }
+    } catch (const std::exception & e) {
+      exit_code_ = static_cast<int>(ExitCode::kRuntimeError);
+      RCLCPP_ERROR(get_logger(), "finalizeAll failed: %s", e.what());
     }
   }
 
@@ -2622,9 +2885,12 @@ private:
   }
 
 private:
-  Config cfg_;
+  mutable std::mutex mutex_;
+  Config base_cfg_;
   std::string config_path_;
   std::string target_lidar_ip_;
+  std::string target_lidar_ips_csv_;
+  std::vector<std::string> target_lidar_ips_;
   std::string input_topic_;
   double accumulation_time_sec_{3.0};
   double roi_distance_threshold_{0.02};
@@ -2634,18 +2900,11 @@ private:
   int num_repeats_{5};
   bool enable_padding_channel_{true};
   double padding_roi_margin_{0.02};
-  Figure8VerificationConfig figure8_cfg_;
+  Figure8VerificationConfig figure8_cfg_template_;
 
-  bool started_{false};
   bool finished_{false};
-  int current_run_index_{0};
-  builtin_interfaces::msg::Time start_time_;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr raw_accum_cloud_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   int exit_code_{static_cast<int>(ExitCode::kRuntimeError)};
-  std::vector<CalibrationRunRecord> all_runs_;
-  BatchCalibrationSummary batch_summary_;
-  Figure8VerificationResult figure8_result_;
+  std::map<std::string, PerLidarState> lidar_states_;
 };
 
 int main(int argc, char ** argv) {
