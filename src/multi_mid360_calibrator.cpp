@@ -2,9 +2,15 @@
 #include <ceres/rotation.h>
 #include <Eigen/Dense>
 #include <pcl/common/point_tests.h>
+#include <pcl/common/transforms.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/filters/filter.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/registration/gicp.h>
+#include <pcl/registration/icp.h>
 #include <pcl/segmentation/sac_segmentation.h>
 #include <yaml-cpp/yaml.h>
 #include <rclcpp/rclcpp.hpp>
@@ -205,6 +211,98 @@ struct BatchCalibrationSummary {
   std::string batch_comment;
 };
 
+enum class CalibrationMode : int {
+  kStaticThreePlaneBatch = 0,
+  kPairwiseRegistration = 1,
+};
+
+enum class PairwiseRegistrationMethod : int {
+  kGicp = 0,
+  kPointToPlaneIcp = 1,
+};
+
+struct PairwiseRoiConfig {
+  double xmin{0.5};
+  double xmax{3.0};
+  double ymin{-1.2};
+  double ymax{1.2};
+  double zmin{-0.5};
+  double zmax{1.5};
+
+  bool contains(const Vector3d & p) const {
+    return p.x() >= xmin && p.x() <= xmax &&
+           p.y() >= ymin && p.y() <= ymax &&
+           p.z() >= zmin && p.z() <= zmax;
+  }
+};
+
+struct PairwiseConfig {
+  std::string reference_lidar_ip;
+  std::string target_lidar_ip;
+  PairwiseRegistrationMethod method{PairwiseRegistrationMethod::kGicp};
+  PairwiseRoiConfig roi_ref;
+  double min_range_m{0.3};
+  double max_range_m{6.0};
+  double voxel_leaf_size_m{0.05};
+  double normal_radius_m{0.20};
+  double max_correspondence_distance_m{0.25};
+  int max_iterations{80};
+  double transformation_epsilon{1e-6};
+  double fitness_epsilon{1e-6};
+  double strict_max_fitness{0.08};
+  double strict_max_translation_delta_m{0.10};
+  double strict_max_rotation_delta_deg{5.0};
+  double strict_max_pairwise_t_diff_m{0.03};
+  double strict_max_pairwise_angle_diff_deg{1.5};
+  int min_points_per_cloud{120};
+};
+
+struct PairwiseRunRecord {
+  int run_index{0};
+  std::string timestamp_iso8601;
+  bool success{false};
+  bool strict_accept{false};
+  std::string registration_method{"gicp"};
+  std::string reference_lidar_ip;
+  std::string target_lidar_ip;
+  Vector3d init_t_m{0.0, 0.0, 0.0};
+  Vector3d init_rpy_rad{0.0, 0.0, 0.0};
+  Matrix3d init_R{Matrix3d::Identity()};
+  Vector3d final_t_m{0.0, 0.0, 0.0};
+  Vector3d final_rpy_rad{0.0, 0.0, 0.0};
+  Matrix3d final_R{Matrix3d::Identity()};
+  double fitness_score{1e18};
+  double translation_delta_m{1e18};
+  double rotation_delta_deg{1e18};
+  int reference_points_raw{0};
+  int target_points_raw{0};
+  int reference_points_used{0};
+  int target_points_used{0};
+  std::string reject_reason;
+};
+
+struct PairwiseBatchSummary {
+  int requested_runs{0};
+  int completed_runs{0};
+  int accepted_runs{0};
+  int rejected_runs{0};
+  std::string reference_lidar_ip;
+  std::string target_lidar_ip;
+  std::vector<PairwiseRunRecord> all_runs;
+  int representative_run_index{-1};
+  Vector3d robust_t_m{0.0, 0.0, 0.0};
+  Eigen::Quaterniond robust_q{1.0, 0.0, 0.0, 0.0};
+  Vector3d robust_rpy_rad{0.0, 0.0, 0.0};
+  Vector3d mean_t_m{0.0, 0.0, 0.0};
+  Vector3d std_t_m{0.0, 0.0, 0.0};
+  Vector3d mean_rpy_deg{0.0, 0.0, 0.0};
+  Vector3d std_rpy_deg{0.0, 0.0, 0.0};
+  double max_pairwise_t_diff_m{0.0};
+  double max_pairwise_angle_diff_deg{0.0};
+  bool batch_stable{false};
+  std::string batch_comment;
+};
+
 struct Figure8VerificationConfig {
   bool enable{false};
   std::string data_path;
@@ -388,6 +486,22 @@ const char * measurementChannelTag(MeasurementChannel c) {
   return "raw";
 }
 
+const char * calibrationModeTag(CalibrationMode mode) {
+  switch (mode) {
+    case CalibrationMode::kStaticThreePlaneBatch: return "static_three_plane_batch";
+    case CalibrationMode::kPairwiseRegistration: return "pairwise_relative_registration";
+  }
+  return "static_three_plane_batch";
+}
+
+const char * pairwiseRegistrationMethodTag(PairwiseRegistrationMethod method) {
+  switch (method) {
+    case PairwiseRegistrationMethod::kGicp: return "gicp";
+    case PairwiseRegistrationMethod::kPointToPlaneIcp: return "point_to_plane_icp";
+  }
+  return "gicp";
+}
+
 std::string nowIso8601Local() {
   const auto now = std::chrono::system_clock::now();
   const std::time_t tt = std::chrono::system_clock::to_time_t(now);
@@ -498,6 +612,22 @@ Eigen::Matrix<T, 3, 3> rpyToRTemplate(const Eigen::Matrix<T, 3, 1> & rpy) {
 
 Matrix3d rpyToR(const Vector3d & rpy) {
   return rpyToRTemplate<double>(rpy);
+}
+
+Vector3d rotationMatrixToRpy(const Matrix3d & R) {
+  return R.eulerAngles(0, 1, 2);
+}
+
+Eigen::Isometry3d makeIsometry(const Matrix3d & R, const Vector3d & t) {
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  T.linear() = R;
+  T.translation() = t;
+  return T;
+}
+
+double rotationAngleDeg(const Matrix3d & R) {
+  const double trace_term = std::max(-1.0, std::min(1.0, 0.5 * (R.trace() - 1.0)));
+  return rad2deg(std::acos(trace_term));
 }
 
 template<typename T>
@@ -867,11 +997,6 @@ Eigen::Isometry3d makePose(const Vector3d & p, const Eigen::Quaterniond & q) {
   T.linear() = q.normalized().toRotationMatrix();
   T.translation() = p;
   return T;
-}
-
-double rotationAngleDeg(const Matrix3d & R) {
-  Eigen::AngleAxisd aa(R);
-  return rad2deg(std::abs(aa.angle()));
 }
 
 std::vector<RelativeMotionPair> buildRelativeMotionPairs(
@@ -1716,6 +1841,24 @@ LogLevel parseLogLevel(const std::string & s) {
   if (s == "warn") return LogLevel::kWarn;
   if (s == "error") return LogLevel::kError;
   fail("--log-level must be info|warn|error");
+}
+
+CalibrationMode parseCalibrationMode(const std::string & s) {
+  if (s == "static_three_plane_batch" || s == "three_plane_batch" || s == "plane") {
+    return CalibrationMode::kStaticThreePlaneBatch;
+  }
+  if (s == "pairwise_relative_registration" || s == "pairwise" || s == "relative") {
+    return CalibrationMode::kPairwiseRegistration;
+  }
+  fail("calibration_mode must be static_three_plane_batch|pairwise_relative_registration");
+}
+
+PairwiseRegistrationMethod parsePairwiseRegistrationMethod(const std::string & s) {
+  if (s == "gicp") return PairwiseRegistrationMethod::kGicp;
+  if (s == "point_to_plane_icp" || s == "point-to-plane" || s == "icp_point_to_plane") {
+    return PairwiseRegistrationMethod::kPointToPlaneIcp;
+  }
+  fail("pairwise_registration_method must be gicp|point_to_plane_icp");
 }
 
 Config parseArgs(int argc, char ** argv) {

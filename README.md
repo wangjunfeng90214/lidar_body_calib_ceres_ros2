@@ -49,7 +49,7 @@ ros2 launch lidar_body_calib_ceres_ros2 calibrate.launch.py
 或直接运行：
 无点云文件保存
 ```bash
-ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 --ros-args \
   -p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
   -p target_lidar_ip:=192.168.1.135 \
   -p accumulation_time_sec:=2.0 \
@@ -65,16 +65,16 @@ ros2 run lidar_body_calib_ceres_ros2 multi_mid360_calibrator --ros-args \
 
 ```bash
 conda deactivate
-rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
-colcon build --packages-select multi_mid360_calibrator
+rm -rf build/lidar_body_calib_ceres_ros2 install/lidar_body_calib_ceres_ros2 log
+colcon build --packages-select lidar_body_calib_ceres_ros2
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
 source install/setup.bash 
 ```
 
 ```bash
-ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 \
   --ros-args \
-  -p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
+  -p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
   -p target_lidar_ip:=192.168.1.135 \
   -p accumulation_time_sec:=3.0 \
   -p roi_distance_threshold:=0.02 \
@@ -131,16 +131,16 @@ ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 
 ```bash
 conda deactivate
-rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
-colcon build --packages-select multi_mid360_calibrator
+rm -rf build/lidar_body_calib_ceres_ros2 install/lidar_body_calib_ceres_ros2 log
+colcon build --packages-select lidar_body_calib_ceres_ros2
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
 source install/setup.bash 
 ```
 
 ```bash
-ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 \
 --ros-args \
--p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
 -p target_lidar_ip:=192.168.1.135 \
 -p input_topic:=/livox/lidar_192_168_1_135 \
 -p accumulation_time_sec:=3.0 \
@@ -212,16 +212,16 @@ timestamp_sec,tx,ty,tz,qx,qy,qz,qw
 
 ```bash
 conda deactivate
-rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
-colcon build --packages-select multi_mid360_calibrator
+rm -rf build/lidar_body_calib_ceres_ros2 install/lidar_body_calib_ceres_ros2 log
+colcon build --packages-select lidar_body_calib_ceres_ros2
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
 source install/setup.bash 
 ```
 
 ```bash
-ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 \
 --ros-args \
--p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
 -p target_lidar_ip:=192.168.1.135 \
 -p input_topic:=/livox/lidar_192_168_1_135 \
 -p accumulation_time_sec:=3.0 \
@@ -251,16 +251,16 @@ ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 
 ```bash
 conda deactivate
-rm -rf build/multi_mid360_calibrator install/multi_mid360_calibrator log
-colcon build --packages-select multi_mid360_calibrator
+rm -rf build/lidar_body_calib_ceres_ros2 install/lidar_body_calib_ceres_ros2 log
+colcon build --packages-select lidar_body_calib_ceres_ros2
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/opt/ros/humble/lib
 source install/setup.bash 
 ```
 
 ```bash
-ros2 run multi_mid360_calibrator multi_mid360_calibrator \
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 \
 --ros-args \
--p config_path:=/home/wangjunfeng/ros2_ws/src/multi_mid360_calibrator/config/lidar_config.yaml \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
 -p target_lidar_ips:="192.168.1.135,192.168.1.141" \
 -p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result_multi.yaml \
 -p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
@@ -269,6 +269,15 @@ ros2 run multi_mid360_calibrator multi_mid360_calibrator \
 也支持只标定一个：
 ```bash
 -p target_lidar_ip:=192.168.1.135
+```
+
+```bash
+ros2 run lidar_body_calib_ceres_ros2 lidar_body_calib_ceres_ros2 \
+--ros-args \
+-p config_path:=/home/wangjunfeng/ros2_ws/src/lidar_body_calib_ceres_ros2/config/lidar_config.yaml \
+-p target_lidar_ips:=192.168.1.135 \
+-p output_result_path:=/home/wangjunfeng/ros2_ws/output/lidar_body_calib_result_multi.yaml \
+-p output_cloud_dir:=/home/wangjunfeng/ros2_ws/output/mid360_calib_outputs
 ```
 
 还支持完全不传 IP，此时会自动从 YAML 顶层把所有雷达都订阅起来一起标定。
